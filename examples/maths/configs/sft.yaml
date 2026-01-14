@@ -1,0 +1,46 @@
+# SFT Training Configuration for Math Tool-Use
+
+model:
+  name_or_path: "Qwen/Qwen3-0.6B"  # ReTool used Qwen2.5-32B-Instruct
+  torch_dtype: "bfloat16"
+  attn_implementation: "sdpa"
+  trust_remote_code: true
+  lora:
+    enabled: true
+    r: 64
+    alpha: 128
+    dropout: 0.05
+    target_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+
+tags:
+  tool_start: "<code>"
+  tool_end: "</code>"
+  response_start: "<interpreter>"
+  response_end: "</interpreter>"
+
+tools:
+  sandbox_url: null  # Set if using remote sandbox
+  sandbox_timeout: 30.0
+  max_retries: 3
+
+training:
+  loss_type: "nll"
+  learning_rate: 2e-5
+  batch_size: 4  # ReTool: micro_batch_size=4, total_batch=32 (scaled down for smaller model)
+  gradient_accumulation_steps: 8  # To get effective batch size of 32
+  num_train_epochs: 6  # ReTool: 6 epochs
+  warmup_ratio: 0.1
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+
+output_dir: "./output/sft"
+seed: 42
+logging_steps: 10
+save_steps: 100

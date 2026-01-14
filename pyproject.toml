@@ -1,0 +1,77 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "techne"
+version = "0.1.0"
+description = "Tool-augmented distillation and reinforcement learning framework for agentic LLMs"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Techne Team" }]
+keywords = ["llm", "reinforcement-learning", "tool-use", "transformers"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    # HuggingFace stack
+    "transformers>=4.45.0",
+    "trl>=0.12.0",
+    "peft>=0.13.0",
+    "datasets>=3.0.0",
+    "accelerate>=1.0.0",
+    # Async HTTP for tool execution
+    "httpx>=0.27.0",
+    # Configuration
+    "pydantic>=2.0.0",
+    "pyyaml>=6.0",
+    # Utilities
+    "rich>=13.0.0",
+]
+
+[project.optional-dependencies]
+vllm = ["vllm>=0.6.0"]
+sglang = ["sglang[all]>=0.3.0"]
+deepspeed = ["deepspeed>=0.15.0"]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.6.0",
+    "mypy>=1.11.0",
+]
+all = ["techne[vllm,sglang,deepspeed,dev]"]
+
+[project.scripts]
+techne-sft = "techne.scripts.train_sft:main"
+techne-rl = "techne.scripts.train_rl:main"
+
+[project.urls]
+Homepage = "https://github.com/techne-team/techne"
+Documentation = "https://techne.readthedocs.io"
+
+[tool.hatch.build.targets.wheel]
+packages = ["techne"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

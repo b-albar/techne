@@ -1,0 +1,43 @@
+# Techne Config for Large Scale Training with FSDP
+# Usage: accelerate launch --config_file configs/accelerate_fsdp2.yaml -m techne.scripts.train_rl --config configs/large_scale_fsdp.yaml
+
+model:
+  name_or_path: "meta-llama/Meta-Llama-3-70B-Instruct"
+  torch_dtype: "bfloat16"
+  attn_implementation: "flash_attention_2"
+  # Disable LoRA for full fine-tuning if resources allow, otherwise keep enabled
+  lora:
+    enabled: true
+    r: 128
+    alpha: 256
+    target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+training:
+  algorithm: "grpo"
+  learning_rate: 5.0e-7  # Lower LR for large models
+  batch_size: 1          # Per GPU batch size (FSDP handles sharding)
+  gradient_accumulation_steps: 8
+  max_steps: 500
+
+  # FSDP settings passed to Trainer
+  fsdp: "full_shard auto_wrap"
+  fsdp_config:
+    backward_prefetch: "backward_pre"
+    forward_prefetch: "false"
+    use_orig_params: "true"
+    cpu_ram_efficient_loading: "true"
+    sync_module_states: "true"
+    offload_params: "false"
+
+tags:
+  tool_start: "<tool_code>"
+  tool_end: "</tool_code>"
+
+tools:
+  sandbox_url: "http://sandbox-service:8080"
+  concurrent_limit: 50
+
+rollout:
+  backend: "vllm"
+  tensor_parallel_size: 4  # vLLM TP size per instance
+  max_turns: 5

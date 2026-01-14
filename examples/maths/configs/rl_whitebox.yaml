@@ -1,0 +1,63 @@
+# RL Training Configuration for Math Tool-Use (White-Box with vLLM)
+# Based on ReTool GRPO recipe: https://github.com/verl-project/verl-recipe/tree/main/retool
+
+model:
+  name_or_path: "./output/sft/checkpoint-final"  # SFT checkpoint
+  torch_dtype: "bfloat16"
+  attn_implementation: "flash_attention_2"
+  trust_remote_code: true
+  lora:
+    enabled: true
+    r: 64
+    alpha: 128
+    dropout: 0.05
+    target_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+
+tags:
+  tool_start: "<code>"
+  tool_end: "</code>"
+  response_start: "<interpreter>"
+  response_end: "</interpreter>"
+
+tools:
+  sandbox_url: null
+  sandbox_timeout: 30.0
+  max_retries: 3
+  concurrent_limit: 10
+
+rollout:
+  backend: "vllm"  # White-box: vLLM backend
+  max_turns: 8  # ReTool: max_turns=8
+  max_new_tokens: 16384  # ReTool: max_response_length=16384
+  temperature: 1.0  # ReTool val: temperature=1.0
+  top_p: 0.6  # ReTool val: top_p=0.6
+  tensor_parallel_size: 1
+  gpu_memory_utilization: 0.7  # Leave room for training
+
+training:
+  algorithm: "grpo"  # Group Relative Policy Optimization (ReTool uses GRPO)
+  learning_rate: 1e-6  # ReTool: actor_lr=1e-6
+  batch_size: 32  # ReTool: ppo_mini_batch_size=64 (scaled down)
+  gradient_accumulation_steps: 2
+  max_steps: 150  # ReTool: 150 steps for GRPO
+  warmup_ratio: 0.1
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+
+  # RL-specific (ReTool GRPO settings)
+  kl_coef: 0.0  # ReTool: kl_coef=0.0
+  gamma: 1.0
+  num_rollouts_per_prompt: 16  # ReTool: n_resp_per_prompt=16 (scaled down to 4-8 for smaller GPU)
+
+output_dir: "./output/rl_whitebox"
+seed: 42
+logging_steps: 5  # More frequent logging (ReTool: test_freq=5)
+save_steps: 30  # ReTool: save_freq=30
+weight_sync_interval: 10  # Sync policy weights to vLLM every 10 steps
