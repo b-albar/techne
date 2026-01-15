@@ -3,10 +3,10 @@ Additional tests for BlackBoxOrchestrator edge cases and validation.
 """
 
 import pytest
-
-from techne.config import TagConfig
 from techne.rollout.orchestrator import BlackBoxOrchestrator
 from techne.rollout.parser import TagParser
+
+from techne.config import TagConfig
 
 
 class EmptyResponseAgent:

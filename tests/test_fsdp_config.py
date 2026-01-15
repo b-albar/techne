@@ -1,5 +1,4 @@
-import pytest
-from techne.config import TechneConfig, TrainingConfig, TrainingAlgorithm
+from techne.config import TechneConfig, TrainingConfig
 
 
 def test_fsdp_config_fields():

@@ -1,0 +1,38 @@
+# Distillation configuration for Math Tool Agent
+#
+# This config trains a smaller student model to mimic a larger teacher.
+# The teacher provides soft labels (logit distributions) for better learning.
+
+model:
+  name_or_path: "Qwen/Qwen3-0.6B"  # Student model (smaller)
+  dtype: "bfloat16"
+  attn_implementation: "sdpa"  # Use PyTorch SDPA for compatibility
+  trust_remote_code: true
+  lora:
+    enabled: true
+    r: 64
+    alpha: 128
+    dropout: 0.05
+    target_modules:
+      - q_proj
+      - v_proj
+
+training:
+  algorithm: "distill_offline"  # Offline distillation
+  teacher_model: "Qwen/Qwen3-1.7B"  # Teacher model (larger)
+  learning_rate: 2e-5
+  batch_size: 1
+  gradient_accumulation_steps: 4
+  max_steps: 50
+  max_seq_length: 2048
+  report_to: "none"
+
+rollout:
+  max_turns: 5
+  temperature: 0.7
+  top_p: 0.95
+
+output_dir: "./output/distill"
+seed: 42
+logging_steps: 5
+save_steps: 100

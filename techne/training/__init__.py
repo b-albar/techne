@@ -1,7 +1,12 @@
-"""Training module for Techne."""
+"""Training module for Techne.
 
-from techne.training.sft import SFTTrainer
-from techne.training.rl import RLTrainer
-from techne.training.rewards import RewardFunction, AccuracyReward
+Provides modular training utilities:
+- trainer: Main TechneTrainer class (unified entry point)
+- sft: SFT/DFT training utilities
+- rl: RL training with GRPO/PPO
+- distill: Distillation training (on-policy and offline)
+"""
 
-__all__ = ["SFTTrainer", "RLTrainer", "RewardFunction", "AccuracyReward"]
+from techne.training.trainer import TechneTrainer
+
+__all__ = ["TechneTrainer"]

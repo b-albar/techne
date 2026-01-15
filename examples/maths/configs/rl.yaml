@@ -1,0 +1,30 @@
+# RL Training Configuration for Math Tool-Use (ReTool style)
+
+model:
+  name_or_path: "Qwen/Qwen2.5-0.5B-Instruct"
+  dtype: "bfloat16"
+  attn_implementation: "sdpa"
+  trust_remote_code: true
+  lora:
+    enabled: true
+    r: 16
+    alpha: 32
+    dropout: 0.05
+    target_modules:
+      - q_proj
+      - v_proj
+
+training:
+  algorithm: "grpo"  # GRPO is stable in TRL
+  learning_rate: 1e-6
+  batch_size: 2
+  gradient_accumulation_steps: 4
+  max_steps: 50
+  sync_weights: true
+  max_seq_length: 1024
+  report_to: "none"
+
+output_dir: "./output/rl"
+seed: 42
+logging_steps: 5
+save_steps: 25

@@ -1,134 +1,118 @@
-"""Evaluation script for math problem solving with tool use."""
-
 import argparse
 import asyncio
 from pathlib import Path
 
-from datasets import load_from_disk
-from transformers import AutoTokenizer
-
+from datasets import load_dataset, load_from_disk
+from math_agent import MathToolAgent
+from rewards import MathReward
 from techne.config import TechneConfig
-from techne.rollout.backends.vllm import VLLMBackend
-from techne.rollout.orchestrator import create_orchestrator
 
 
-def extract_answer(text: str) -> str:
-    """Extract the final answer from generated text."""
-    # Look for common patterns like "The answer is X" or "= X"
-    lines = text.strip().split("\n")
-    for line in reversed(lines):
-        if "answer is" in line.lower():
-            # Extract number after "answer is"
-            parts = line.lower().split("answer is")
-            if len(parts) > 1:
-                return parts[1].strip().strip(".")
-        if line.strip().startswith("="):
-            return line.strip()[1:].strip()
-    # Default: return last line
-    return lines[-1].strip() if lines else ""
+def extract_qa(example):
+    """Extract question and answer from common math dataset formats."""
+    # 1. Answer extraction first (easier)
+    a = example.get("answer") or example.get("solution") or example.get("ground_truth")
+    if not a and "reward_model" in example:
+        rm = example["reward_model"]
+        a = rm.get("ground_truth") if isinstance(rm, dict) else None
+
+    # 2. Question/Prompt extraction
+    # If 'prompt' is present and is a list, it's often the best representation
+    q = example.get("prompt")
+    if q and isinstance(q, list):
+        return q, a
+
+    # Fallback to string keys
+    q = example.get("question") or example.get("problem") or example.get("problem_content")
+    if not q and "prompt" in example:
+        q = example["prompt"]
+
+    return q, a
 
 
-async def evaluate_problem(orchestrator, prompt: str, ground_truth: str) -> bool:
-    """Evaluate a single math problem.
-
-    Returns:
-        True if the answer is correct
-    """
-    trajectory = await orchestrator.rollout_single(prompt)
-
-    # Extract predicted answer
-    predicted = extract_answer(trajectory.final_response)
-
-    # Compare (normalize both)
-    predicted_normalized = predicted.strip().lower().replace(",", "")
-    ground_truth_normalized = str(ground_truth).strip().lower().replace(",", "")
-
-    return predicted_normalized == ground_truth_normalized
-
-
-async def main():
-    parser = argparse.ArgumentParser(description="Evaluate math tool-use model")
-    parser.add_argument(
-        "--checkpoint",
-        type=Path,
-        required=True,
-        help="Path to model checkpoint",
+async def run_evaluation(args):
+    # 1. Load Config & Agent
+    config_path = Path(args.config)
+    config = (
+        TechneConfig.from_yaml(config_path)
+        if config_path.exists()
+        else TechneConfig(model={"name_or_path": args.model})
     )
-    parser.add_argument(
-        "--dataset",
-        type=Path,
-        default=Path("examples/maths/data/eval"),
-        help="Path to evaluation dataset",
-    )
-    parser.add_argument(
-        "--config",
-        type=Path,
-        default=Path("examples/maths/configs/rl_whitebox.yaml"),
-        help="Path to config file",
-    )
-    parser.add_argument(
-        "--max-samples",
-        type=int,
-        default=None,
-        help="Maximum number of samples to evaluate",
-    )
+    config.model.name_or_path = args.model
 
-    args = parser.parse_args()
+    agent = MathToolAgent(config)
+    reward_fn = MathReward()
 
-    # Load configuration
-    config = TechneConfig.from_yaml(args.config)
-    config.model.name_or_path = str(args.checkpoint)
+    # 2. Load Data
+    data_path = Path(args.dataset)
+    if not data_path.exists():
+        # Try relative to project root or examples dir
+        possibilities = [
+            Path("examples/maths") / args.dataset,
+            Path(__file__).parent.parent / args.dataset,
+            Path(__file__).parent.parent / "data" / args.dataset
+            if "data" not in args.dataset
+            else None,
+        ]
+        for p in possibilities:
+            if p and p.exists():
+                data_path = p
+                break
 
-    print(f"Evaluating: {args.checkpoint}")
-    print(f"Dataset: {args.dataset}")
+    print(f"Loading dataset from: {data_path}")
+    if data_path.exists():
+        ds = load_from_disk(str(data_path))
+        eval_data = ds["test"] if "test" in ds else (ds["train"] if "train" in ds else ds)
+    else:
+        eval_data = load_dataset(args.dataset, split="train")
 
-    # Load evaluation data
-    dataset = load_from_disk(str(args.dataset))
-    eval_data = dataset["test"] if "test" in dataset else dataset["train"]
-
-    if args.max_samples:
+    if args.max_samples > 0:
         eval_data = eval_data.select(range(min(args.max_samples, len(eval_data))))
 
-    print(f"Evaluating on {len(eval_data)} problems\n")
-
-    # Create backend and orchestrator
-    backend = VLLMBackend(
-        model_name_or_path=str(args.checkpoint),
-        tensor_parallel_size=config.rollout.tensor_parallel_size,
-        gpu_memory_utilization=0.9,
-    )
-
-    orchestrator = create_orchestrator(
-        backend=backend,
-        tags=config.tags,
-        rollout_config=config.rollout,
-    )
-
-    # Evaluate
+    # 3. Process Evaluation
     correct = 0
     total = len(eval_data)
+    print(f"Starting evaluation on {total} samples...\n")
 
-    async with backend:
-        for idx, example in enumerate(eval_data):
-            problem = example["problem"]
-            answer = example["answer"]
+    for i, example in enumerate(eval_data):
+        q, a = extract_qa(example)
+        if not q:
+            continue
 
-            is_correct = await evaluate_problem(orchestrator, problem, answer)
+        traj = (await agent.collect_trajectories([q]))[0]
+        score = reward_fn(traj, a)
 
-            if is_correct:
-                correct += 1
-                status = "✓"
-            else:
-                status = "✗"
+        # Determine what was predicted for logging
+        last_assist = next((s.content for s in reversed(traj.steps) if s.role == "assistant"), "")
+        pred = MathReward.extract_answer(last_assist)
 
-            print(
-                f"[{idx + 1}/{total}] {status} Accuracy: {correct}/{idx + 1} ({100 * correct / (idx + 1):.1f}%)"
-            )
+        is_correct = score > 0
+        correct += int(is_correct)
 
-    print("\n" + "=" * 60)
-    print(f"Final Accuracy: {correct}/{total} ({100 * correct / total:.2f}%)")
-    print("=" * 60)
+        icon = "✓" if is_correct else "✗"
+        q_str = q[-1]["content"] if isinstance(q, list) else str(q)
+        print(f"[{i + 1}/{total}] {icon} | Q: {q_str[:50]}... | Target: {a} | Pred: {pred}")
+
+    # 4. Final Summary
+    acc = 100 * correct / total if total > 0 else 0
+    print("\n" + "=" * 40)
+    print("Evaluation Results")
+    print(f"Accuracy: {correct}/{total} ({acc:.2f}%)")
+    print("=" * 40)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", type=str, required=True, help="Model name or path")
+    parser.add_argument("--dataset", type=str, default="data/eval", help="Path to evaluation data")
+    parser.add_argument("--config", type=str, default="examples/maths/configs/sft.yaml")
+    parser.add_argument(
+        "--max-samples", type=int, default=-1, help="Max samples to evaluate (-1 for all)"
+    )
+    args = parser.parse_args()
+
+    asyncio.run(run_evaluation(args))
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

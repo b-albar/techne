@@ -1,0 +1,18 @@
+# techne/configs/distill_off_policy.yaml
+# Mode: Off-policy SFT / Distillation
+# Collect expert trajectories (teacher) -> Train student
+model:
+  name_or_path: "meta-llama/Llama-3-8B-Instruct"
+  dtype: "bfloat16"
+
+training:
+  algorithm: "sft"
+  sync_weights: false # Teacher remains fixed
+  learning_rate: 2.0e-5
+  batch_size: 4
+  max_steps: 1000
+  max_seq_length: 4096
+  report_to: "wandb"
+
+output_dir: "./output/distill_off"
+seed: 42

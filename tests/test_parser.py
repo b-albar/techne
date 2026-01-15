@@ -1,8 +1,9 @@
 """Tests for tag parser."""
 
 import pytest
+from techne.rollout.parser import TagParser
+
 from techne.config import TagConfig
-from techne.rollout.parser import TagParser, ParsedToolCall
 
 
 class TestTagParser:

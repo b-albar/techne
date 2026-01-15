@@ -1,16 +1,15 @@
 """Tests for Techne configuration system."""
 
-import pytest
 from techne.config import (
-    TagConfig,
-    ToolConfig,
     LoRAConfig,
     ModelConfig,
-    RolloutConfig,
-    TrainingConfig,
-    TechneConfig,
-    TrainingAlgorithm,
     RolloutBackendType,
+    RolloutConfig,
+    TagConfig,
+    TechneConfig,
+    ToolConfig,
+    TrainingAlgorithm,
+    TrainingConfig,
 )
 
 

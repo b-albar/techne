@@ -2,7 +2,7 @@
 
 model:
   name_or_path: "Qwen/Qwen3-0.6B"  # ReTool used Qwen2.5-32B-Instruct
-  torch_dtype: "bfloat16"
+  dtype: "bfloat16"
   attn_implementation: "sdpa"
   trust_remote_code: true
   lora:
@@ -19,26 +19,17 @@ model:
       - up_proj
       - down_proj
 
-tags:
-  tool_start: "<code>"
-  tool_end: "</code>"
-  response_start: "<interpreter>"
-  response_end: "</interpreter>"
-
-tools:
-  sandbox_url: null  # Set if using remote sandbox
-  sandbox_timeout: 30.0
-  max_retries: 3
-
 training:
-  loss_type: "nll"
+  algorithm: "sft"
   learning_rate: 2e-5
-  batch_size: 4  # ReTool: micro_batch_size=4, total_batch=32 (scaled down for smaller model)
-  gradient_accumulation_steps: 8  # To get effective batch size of 32
-  num_train_epochs: 6  # ReTool: 6 epochs
+  batch_size: 1  # Reduced for smaller GPU
+  gradient_accumulation_steps: 8
+  max_seq_length: 2048  # Limit sequence length
+  num_train_epochs: 6
   warmup_ratio: 0.1
   weight_decay: 0.01
   max_grad_norm: 1.0
+  max_steps: 50  # Quick test
 
 output_dir: "./output/sft"
 seed: 42
