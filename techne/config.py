@@ -23,6 +23,11 @@ class TrainingAlgorithm(str, Enum):
     DFT = "dft"
 
 
+class DistillationMode(str, Enum):
+    FORWARD_KL = "forward_kl"
+    SLIM = "slim"
+
+
 class LoRAConfig(BaseModel):
     enabled: bool = Field(default=True)
     r: int = Field(default=64)
@@ -52,6 +57,8 @@ class TrainingConfig(BaseModel):
     # For distillation: teacher model path and KL weight
     teacher_model: str | None = Field(default=None)
     kl_weight: float = Field(default=0.5)  # Weight for KL loss vs SFT loss in distillation
+    distillation_mode: DistillationMode = Field(default=DistillationMode.FORWARD_KL)
+    slim_top_k: int | None = Field(default=None)
 
 
 class RolloutConfig(BaseModel):

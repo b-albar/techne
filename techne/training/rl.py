@@ -37,6 +37,36 @@ def train_rl(
         Training result
     """
     algo = config.training.algorithm
+
+    # -------------------------------------------------------------------------
+    # Data Validation
+    # -------------------------------------------------------------------------
+    # Data Validation
+    assert len(dataset) > 0, "RL dataset is empty!"
+
+    sample = dataset[0]
+    # Check standard Online RL requirement
+    if "prompt" not in sample and "input_ids" not in sample:
+        # Maybe it's Offline RL with pre-computed trajectories?
+        required_offline = ["token_ids", "log_probs", "logits"]
+        has_offline_data = any(k in sample for k in required_offline)
+        assert has_offline_data, (
+            f"RL dataset must contain 'prompt' (online) or 'token_ids'/'log_probs' (offline). Found: {list(sample.keys())}"
+        )
+
+    # Check for empty fields if present (User specific request)
+    if "token_ids" in sample:
+        assert len(sample["token_ids"]) > 0, "Found sample with empty 'token_ids' in RL dataset!"
+
+    if "log_probs" in sample:
+        assert len(sample["log_probs"]) > 0, "Found sample with empty 'log_probs' in RL dataset!"
+
+    if "logits" in sample:
+        if hasattr(sample["logits"], "numel"):
+            assert sample["logits"].numel() > 0, "Found sample with empty 'logits' in RL dataset!"
+        else:
+            assert len(sample["logits"]) > 0, "Found sample with empty 'logits' list in RL dataset!"
+
     reward_funcs = []
 
     if algo == TrainingAlgorithm.DISTILL:
