@@ -38,13 +38,25 @@ async def main():
 
         ds = load_from_disk(data_path)
         if hasattr(ds, "keys") and "train" in ds:
-            ds = ds["train"]
+            train_dataset = ds["train"]
     except Exception as e:
         print(f"Error loading dataset: {e}")
         exit(1)
 
     # 3. Initialize Trainer
     trainer = TechneTrainer(config)
+
+    # Print model parameters
+    if hasattr(trainer.model, "print_trainable_parameters"):
+        trainer.model.print_trainable_parameters()
+    else:
+        trainable_params = sum(p.numel() for p in trainer.model.parameters() if p.requires_grad)
+        all_params = sum(p.numel() for p in trainer.model.parameters())
+        print(
+            f"trainable params: {trainable_params:,d} || "
+            f"all params: {all_params:,d} || "
+            f"trainable%: {100 * trainable_params / all_params:.4f}"
+        )
 
     # 4. Preprocess with incremental tokenization
     # Import MathToolAgent for its tokenize_messages method
@@ -58,8 +70,7 @@ async def main():
         messages = sample["prompt"]
         return agent.tokenize_messages(messages)
 
-    # Select subset and tokenize
-    train_dataset = ds.select(range(min(100, len(ds))))
+    # Tokenize
     print(f"Tokenizing {len(train_dataset)} samples incrementally...")
     train_dataset = train_dataset.map(preprocess_incremental, remove_columns=["prompt"])
 

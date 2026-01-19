@@ -10,6 +10,7 @@ import contextlib
 import traceback
 import signal
 import torch
+import asyncio
 from typing import Any
 from techne.agent import Agent
 from techne.config import TechneConfig
@@ -112,6 +113,8 @@ class MathToolAgent(Agent):
                     device_map="auto",
                     dtype=dtype,
                 )
+            if self.config.model.compile and hasattr(torch, "compile"):
+                self.model = torch.compile(self.model)
         else:
             self.backend = "openai"
             try:
@@ -175,10 +178,8 @@ class MathToolAgent(Agent):
         }
 
     async def collect_trajectories(self, prompts: list[str]) -> list[Trajectory]:
-        results = []
-        for p in prompts:
-            results.append(await self._run_rollout(p))
-        return results
+        tasks = [self._run_rollout(p) for p in prompts]
+        return await asyncio.gather(*tasks)
 
     async def _run_rollout(self, prompt: str | list[Any] | dict[str, Any]) -> Trajectory:
         trajectory = Trajectory()
@@ -257,7 +258,7 @@ class MathToolAgent(Agent):
             if self.backend == "openai":
                 text, meta = await self._generate_openai(context)
             else:
-                text, meta = self._generate_hf(context)
+                text, meta = await asyncio.to_thread(self._generate_hf, context)
 
             # 2. Add Assistant Step
             add_turn(
@@ -302,9 +303,6 @@ class MathToolAgent(Agent):
                 # Finished
                 break
             else:
-                # No tool usage and no answer? Model might be babbling or confused.
-                # We treat it as finished to avoid infinite loops, or let it continue if we think it's multi-step reasoning without tools.
-                # Ideally we force it to continue if it hasn't answered.
                 pass
 
         return trajectory

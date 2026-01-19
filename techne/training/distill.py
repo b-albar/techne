@@ -139,7 +139,7 @@ def train_distill_offline(
     teacher_model = AutoModelForCausalLM.from_pretrained(
         teacher_model_path,
         device_map="auto",
-        torch_dtype=torch.bfloat16 if config.model.dtype == "bfloat16" else torch.float16,
+        dtype=torch.bfloat16 if config.model.dtype == "bfloat16" else torch.float16,
     )
     teacher_model.eval()
     teacher_tokenizer = AutoTokenizer.from_pretrained(teacher_model_path)

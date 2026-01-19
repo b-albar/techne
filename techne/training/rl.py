@@ -1,16 +1,13 @@
-"""RL training utilities using TRL's GRPO/PPO trainers."""
+"""Async RL training using Ray for on-policy methods (GRPO/PPO/GSPO/DISTILL)."""
 
 from collections.abc import Callable
 from typing import Any
 
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from trl import GRPOConfig, GRPOTrainer
-
 from techne.config import TechneConfig, TrainingAlgorithm
+from techne.training.async_rl import train_async_rl
 
 
-def train_rl(
+async def train_rl(
     config: TechneConfig,
     model,
     tokenizer,
@@ -18,96 +15,63 @@ def train_rl(
     reward_fn: Callable | None = None,
     **kwargs,
 ):
-    """Train using online RL with GRPO/PPO.
+    """Train using async on-policy RL with Ray workers.
 
-    Supports:
-    - GRPO/PPO/GSPO: User-provided reward function
-    - DISTILL: Built-in KL reward from teacher model
-    - OFFLINE_RL: Off-policy training on pre-collected data
+    Supports: GRPO, PPO, GSPO, DISTILL
 
     Args:
         config: Techne configuration
         model: Model to train
         tokenizer: Tokenizer
-        dataset: HF Dataset with prompts
-        reward_fn: Optional reward function (trajectory, ground_truth) -> float
+        dataset: HF Dataset with "prompt" column
+        reward_fn: Reward function (prompts, completions) -> list[float]
         **kwargs: Additional arguments
 
     Returns:
-        Training result
+        Training result dict
     """
     algo = config.training.algorithm
 
-    # -------------------------------------------------------------------------
-    # Data Validation
-    # -------------------------------------------------------------------------
-    # Data Validation
+    # Validate dataset
     assert len(dataset) > 0, "RL dataset is empty!"
-
     sample = dataset[0]
-    # Check standard Online RL requirement
-    if "prompt" not in sample and "input_ids" not in sample:
-        # Maybe it's Offline RL with pre-computed trajectories?
-        required_offline = ["token_ids", "log_probs", "logits"]
-        has_offline_data = any(k in sample for k in required_offline)
-        assert has_offline_data, (
-            f"RL dataset must contain 'prompt' (online) or 'token_ids'/'log_probs' (offline). Found: {list(sample.keys())}"
-        )
+    assert "prompt" in sample or "text" in sample, (
+        f"Dataset must have 'prompt' or 'text' column. Found: {list(sample.keys())}"
+    )
 
-    # Check for empty fields if present (User specific request)
-    if "token_ids" in sample:
-        assert len(sample["token_ids"]) > 0, "Found sample with empty 'token_ids' in RL dataset!"
+    # Convert TRL-style reward_fn to simple (prompt, completion) -> float
+    simple_reward_fn = None
+    if reward_fn:
 
-    if "log_probs" in sample:
-        assert len(sample["log_probs"]) > 0, "Found sample with empty 'log_probs' in RL dataset!"
+        def simple_reward_fn(sample: dict, completion: str) -> float:
+            prompt = sample.get("prompt") or sample.get("text") or str(sample)
+            if isinstance(prompt, list):
+                # Cannot use TRL reward fn with list prompts easily
+                return 0.0
+            return reward_fn([prompt], [completion])[0]
 
-    if "logits" in sample:
-        if hasattr(sample["logits"], "numel"):
-            assert sample["logits"].numel() > 0, "Found sample with empty 'logits' in RL dataset!"
-        else:
-            assert len(sample["logits"]) > 0, "Found sample with empty 'logits' list in RL dataset!"
-
-    reward_funcs = []
-
+    # For DISTILL, create KL reward from teacher
     if algo == TrainingAlgorithm.DISTILL:
-        # On-policy distillation: reward = -reverse_KL from teacher
-        reward_funcs.append(_create_kl_reward_fn(config, tokenizer))
-        print("Using KL reward for on-policy distillation")
+        simple_reward_fn = _create_kl_reward_fn(config, tokenizer)
 
-    elif reward_fn:
-        # User-provided reward function
-        reward_funcs.append(_create_reward_wrapper(reward_fn))
-    else:
-        # Default: zero reward
-        reward_funcs.append(lambda prompts, completions, **kw: [0.0] * len(completions))
+    print(f"Starting async {algo.value.upper()} training on {len(dataset)} samples...")
 
-    # GRPO Config
-    args = GRPOConfig(
-        output_dir=config.output_dir,
-        learning_rate=config.training.learning_rate,
-        per_device_train_batch_size=config.training.batch_size,
-        gradient_accumulation_steps=config.training.gradient_accumulation_steps,
-        max_steps=config.training.max_steps,
-        logging_steps=config.logging_steps,
-        report_to=getattr(config.training, "report_to", "none"),
-        bf16=config.model.dtype == "bfloat16",
-    )
-
-    trainer = GRPOTrainer(
+    return await train_async_rl(
+        config=config,
         model=model,
-        args=args,
-        train_dataset=dataset,
-        processing_class=tokenizer,
-        reward_funcs=reward_funcs,
+        tokenizer=tokenizer,
+        dataset=dataset,
+        reward_fn=simple_reward_fn,
+        algorithm=algo.value,
+        **kwargs,
     )
-
-    algo_name = algo.value.upper()
-    print(f"Starting {algo_name} training on {len(dataset)} samples...")
-    return trainer.train()
 
 
 def _create_kl_reward_fn(config: TechneConfig, student_tokenizer):
     """Create KL-based reward function for on-policy distillation."""
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
     teacher_model_path = config.training.teacher_model
     if not teacher_model_path:
         raise ValueError("On-policy distillation requires teacher_model in config")
@@ -122,45 +86,29 @@ def _create_kl_reward_fn(config: TechneConfig, student_tokenizer):
 
     from techne.training.distill import compute_distillation_reward
 
-    def kl_reward_fn(prompts, completions, completion_ids=None, **kwargs):
+    def kl_reward_fn(sample: dict, completion: str) -> float:
         """Compute -reverse_KL as reward for distillation."""
-        rewards = []
-        for prompt, completion in zip(prompts, completions):
-            try:
-                reward = compute_distillation_reward(
-                    completion_text=completion,
-                    prompt_text=prompt,
-                    teacher_model=teacher_model,
-                    teacher_tokenizer=teacher_tokenizer,
-                    student_tokenizer=student_tokenizer,
-                    use_kl=False,  # RL trainer computes its own KL penalty usually, so we use Teacher Likelihood
-                )
-                rewards.append(reward)
-            except Exception as e:
-                print(f"Reward computation failed: {e}")
-                rewards.append(0.0)
-        return rewards
+        # Extract prompt string for teacher
+        prompt = sample.get("prompt") or sample.get("text") or str(sample)
+        if isinstance(prompt, list):
+            # For teacher, we need text. Use apply_chat_template if available?
+            # Or assume teacher handles it. compute_distillation_reward takes prompt_text.
+            # We should probably convert list to string via tokenizer template
+            prompt = student_tokenizer.apply_chat_template(
+                prompt, tokenize=False, add_generation_prompt=True
+            )
+
+        try:
+            return compute_distillation_reward(
+                completion_text=completion,
+                prompt_text=prompt,
+                teacher_model=teacher_model,
+                teacher_tokenizer=teacher_tokenizer,
+                student_tokenizer=student_tokenizer,
+                use_kl=False,
+            )
+        except Exception as e:
+            print(f"Reward computation failed: {e}")
+            return 0.0
 
     return kl_reward_fn
-
-
-def _create_reward_wrapper(reward_fn: Callable):
-    """Wrap user reward function to match TRL's signature."""
-
-    def trl_reward_wrapper(prompts, completions, **kwargs):
-        """TRL reward signature: (prompts, completions) -> list[float]"""
-        rewards = []
-        ground_truths = kwargs.get("ground_truth", [None] * len(completions))
-        for i, completion in enumerate(completions):
-            gt = ground_truths[i] if i < len(ground_truths) else None
-
-            # Create a simple trajectory-like object
-            class SimpleTrajectory:
-                def __init__(self, text):
-                    self.steps = [type("Step", (), {"role": "assistant", "content": str(text)})()]
-
-            traj = SimpleTrajectory(completion)
-            rewards.append(reward_fn(traj, gt) if gt else 0.0)
-        return rewards
-
-    return trl_reward_wrapper
