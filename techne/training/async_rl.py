@@ -37,6 +37,72 @@ class Sample:
     ref_logprobs: list[float]
     reward: float = 0.0
     advantage: float = 0.0
+    policy_version: int = 0  # For staleness tracking
+
+
+class AsyncResultCache:
+    """Async cache for collecting worker results with dynamic batching.
+
+    Results are pushed as they complete and batches are formed as soon as
+    enough samples are available, regardless of which workers produced them.
+    """
+
+    def __init__(self, minibatch_size: int = 8):
+        self.minibatch_size = minibatch_size
+        self._queue: asyncio.Queue[Sample] = asyncio.Queue()
+        self._pending: list[Sample] = []
+        self._lock = asyncio.Lock()
+
+    async def push(self, samples: list[Sample]) -> None:
+        """Push completed samples to the cache."""
+        for sample in samples:
+            await self._queue.put(sample)
+
+    async def push_one(self, sample: Sample) -> None:
+        """Push a single sample to the cache."""
+        await self._queue.put(sample)
+
+    async def get_batch(self, timeout: float = 0.5) -> list[Sample] | None:
+        """Get a batch of samples as soon as minibatch_size are available.
+
+        Returns None if timeout expires before enough samples arrive.
+        """
+        async with self._lock:
+            # First drain any pending samples from queue
+            while not self._queue.empty():
+                try:
+                    sample = self._queue.get_nowait()
+                    self._pending.append(sample)
+                except asyncio.QueueEmpty:
+                    break
+
+            # If we have enough, return a batch immediately
+            if len(self._pending) >= self.minibatch_size:
+                batch = self._pending[: self.minibatch_size]
+                self._pending = self._pending[self.minibatch_size :]
+                return batch
+
+        # Wait for more samples with timeout
+        deadline = asyncio.get_event_loop().time() + timeout
+        while True:
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                return None
+
+            try:
+                sample = await asyncio.wait_for(self._queue.get(), timeout=remaining)
+                async with self._lock:
+                    self._pending.append(sample)
+                    if len(self._pending) >= self.minibatch_size:
+                        batch = self._pending[: self.minibatch_size]
+                        self._pending = self._pending[self.minibatch_size :]
+                        return batch
+            except asyncio.TimeoutError:
+                return None
+
+    def pending_count(self) -> int:
+        """Return number of samples waiting in the cache."""
+        return len(self._pending) + self._queue.qsize()
 
 
 @dataclass
@@ -296,6 +362,250 @@ class TrainingWorker:
         """Cleanup distributed process group."""
         if self.distributed_backend != DistributedBackend.NONE:
             torch.distributed.destroy_process_group()
+
+
+def compute_advantages(samples: list[Sample]) -> list[Sample]:
+    """Compute advantages for samples grouped by prompt (GRPO style)."""
+    prompt_groups: dict[any, list[Sample]] = {}
+    for s in samples:
+        # Handle unhashable prompts (e.g. list of messages)
+        if isinstance(s.prompt, list):
+            key = tuple(frozenset(d.items()) for d in s.prompt)
+        else:
+            key = s.prompt
+
+        if key not in prompt_groups:
+            prompt_groups[key] = []
+        prompt_groups[key].append(s)
+
+    for group in prompt_groups.values():
+        rewards = [s.reward for s in group]
+        mean_r = sum(rewards) / len(rewards) if rewards else 0.0
+        std_r = (
+            (sum((r - mean_r) ** 2 for r in rewards) / len(rewards)) ** 0.5
+            if len(rewards) > 1
+            else 1.0
+        )
+        std_r = max(std_r, 1e-8)
+
+        for s in group:
+            s.advantage = (s.reward - mean_r) / std_r
+
+    return samples
+
+
+def should_skip_batch(samples: list[Sample], min_advantage_std: float = 1e-6) -> bool:
+    """Check if batch should be skipped (zero gradient in GRPO).
+
+    In GRPO, if all rewards in a group are identical, advantages are zero
+    and the gradient is zero. This wastes compute.
+
+    From Open-Instruct: "groups of instances whose rewards are identical
+    (which leads to zero gradients in GRPO) are removed."
+    """
+    # Check if all advantages are effectively zero
+    advantages = [s.advantage for s in samples]
+    if not advantages:
+        return True
+    std = (sum((a - sum(advantages) / len(advantages)) ** 2 for a in advantages) / len(advantages)) ** 0.5
+    return std < min_advantage_std
+
+
+class DynamicBatcher:
+    """Manages continuous dispatch to workers and collects results dynamically.
+
+    Key features:
+    - Workers are kept busy with continuous dispatch
+    - Results are collected as they arrive (not waiting for all workers)
+    - Batches are formed as soon as minibatch_size samples are ready
+    - Decouples generation speed from training speed
+    - Active sampling filter to skip zero-gradient batches (Open-Instruct)
+    - Staleness tracking to bound off-policy drift (AReaL/VeRL)
+    """
+
+    def __init__(
+        self,
+        workers: list,
+        dataset: Any,
+        reward_fn: Callable[[dict, str], float] | None,
+        minibatch_size: int = 8,
+        max_pending_per_worker: int = 2,
+        num_prompts_per_dispatch: int = 1,
+        staleness_threshold: int = 3,
+    ):
+        self.workers = workers
+        self.dataset = dataset
+        self.reward_fn = reward_fn
+        self.minibatch_size = minibatch_size
+        self.max_pending_per_worker = max_pending_per_worker
+        self.num_prompts_per_dispatch = num_prompts_per_dispatch
+        self.staleness_threshold = staleness_threshold
+
+        self.cache = AsyncResultCache(minibatch_size)
+        self.prompt_idx = 0
+        self._worker_pending: dict[int, int] = {i: 0 for i in range(len(workers))}
+        self._active_tasks: set[asyncio.Task] = set()
+        self._stop_event = asyncio.Event()
+        self._dispatch_task: asyncio.Task | None = None
+
+        # Policy version tracking
+        self._policy_version = 0
+        self._policy_version_lock = asyncio.Lock()
+
+        # Stats
+        self.stats = {
+            "samples_generated": 0,
+            "samples_dropped_stale": 0,
+            "batches_skipped_zero_grad": 0,
+        }
+
+    def start(self) -> None:
+        """Start the continuous dispatch loop."""
+        self._dispatch_task = asyncio.create_task(self._dispatch_loop())
+
+    async def stop(self) -> None:
+        """Stop dispatching and wait for pending tasks."""
+        self._stop_event.set()
+        if self._dispatch_task:
+            await self._dispatch_task
+        # Wait for remaining active tasks
+        if self._active_tasks:
+            await asyncio.gather(*self._active_tasks, return_exceptions=True)
+
+    async def _dispatch_loop(self) -> None:
+        """Continuously dispatch work to workers that have capacity."""
+        while not self._stop_event.is_set():
+            dispatched = False
+
+            for worker_idx, worker in enumerate(self.workers):
+                # Check if worker has capacity
+                if self._worker_pending[worker_idx] >= self.max_pending_per_worker:
+                    continue
+
+                # Check if we have more prompts
+                if self.prompt_idx >= len(self.dataset):
+                    continue
+
+                # Collect multiple prompts for this dispatch
+                prompts_batch = []
+                for _ in range(self.num_prompts_per_dispatch):
+                    if self.prompt_idx >= len(self.dataset):
+                        break
+                    prompts_batch.append(self.dataset[self.prompt_idx])
+                    self.prompt_idx += 1
+
+                if not prompts_batch:
+                    continue
+
+                self._worker_pending[worker_idx] += 1
+                dispatched = True
+
+                # Capture current policy version for this generation
+                generation_version = self._policy_version
+
+                # Create task to handle this worker's result
+                task = asyncio.create_task(
+                    self._handle_worker_result(
+                        worker, worker_idx, prompts_batch, generation_version
+                    )
+                )
+                self._active_tasks.add(task)
+                task.add_done_callback(self._active_tasks.discard)
+
+            # If no work dispatched and all prompts consumed, we're done
+            if not dispatched:
+                if self.prompt_idx >= len(self.dataset) and all(
+                    p == 0 for p in self._worker_pending.values()
+                ):
+                    break
+                await asyncio.sleep(0.01)  # Small delay before retry
+
+    async def _handle_worker_result(
+        self, worker, worker_idx: int, prompts: list[dict], generation_version: int
+    ) -> None:
+        """Handle result from a single worker dispatch."""
+        try:
+            future = worker.generate_and_score.remote(prompts, self.reward_fn)
+            samples = await asyncio.wrap_future(future.future())
+
+            # Stamp samples with the policy version they were generated under
+            for s in samples:
+                s.policy_version = generation_version
+
+            # Compute advantages and push to cache immediately
+            samples = compute_advantages(samples)
+            self.stats["samples_generated"] += len(samples)
+            await self.cache.push(samples)
+        except Exception as e:
+            print(f"Worker {worker_idx} error: {e}")
+        finally:
+            self._worker_pending[worker_idx] -= 1
+
+    async def get_batch(
+        self,
+        timeout: float = 0.5,
+        current_policy_version: int | None = None,
+        skip_zero_gradient: bool = True,
+    ) -> list[Sample] | None:
+        """Get the next available batch from the cache.
+
+        Args:
+            timeout: Max time to wait for a batch
+            current_policy_version: If provided, filter out samples that are too stale
+            skip_zero_gradient: If True, skip batches where all advantages are ~0
+        """
+        while True:
+            batch = await self.cache.get_batch(timeout)
+            if batch is None:
+                return None
+
+            # Filter stale samples if staleness tracking is enabled
+            if current_policy_version is not None and self.staleness_threshold > 0:
+                fresh_samples = [
+                    s for s in batch
+                    if current_policy_version - s.policy_version <= self.staleness_threshold
+                ]
+                stale_count = len(batch) - len(fresh_samples)
+                if stale_count > 0:
+                    self.stats["samples_dropped_stale"] += stale_count
+                    # Re-push fresh samples if not enough for a batch
+                    if len(fresh_samples) < self.minibatch_size:
+                        for s in fresh_samples:
+                            await self.cache.push_one(s)
+                        continue
+                    batch = fresh_samples[:self.minibatch_size]
+
+            # Skip zero-gradient batches (Open-Instruct active sampling filter)
+            if skip_zero_gradient and should_skip_batch(batch):
+                self.stats["batches_skipped_zero_grad"] += 1
+                continue
+
+            return batch
+
+    async def increment_policy_version(self) -> int:
+        """Increment policy version after a weight sync. Returns new version."""
+        async with self._policy_version_lock:
+            self._policy_version += 1
+            return self._policy_version
+
+    @property
+    def policy_version(self) -> int:
+        """Current policy version."""
+        return self._policy_version
+
+    @property
+    def prompts_consumed(self) -> int:
+        """Number of prompts that have been dispatched."""
+        return self.prompt_idx
+
+    @property
+    def is_exhausted(self) -> bool:
+        """True if all prompts consumed and no pending work."""
+        return (
+            self.prompt_idx >= len(self.dataset)
+            and all(p == 0 for p in self._worker_pending.values())
+            and self.cache.pending_count() < self.minibatch_size
+        )
 
 
 @ray.remote
@@ -582,11 +892,6 @@ async def train_async_rl(
             weight_decay=config.training.weight_decay,
         )
 
-    batcher = ExperienceBatcher.remote(minibatch_size=minibatch_size)
-
-    prompt_idx = 0
-    batch_size_per_worker = max(1, minibatch_size // (num_inference_workers * num_generations))
-
     global_step = 0
     grad_accum_count = 0
     total_metrics: dict[str, float] = {}
@@ -597,55 +902,49 @@ async def train_async_rl(
     )
 
     print(
-        f"Async {algorithm.upper()}: {num_inference_workers} inference workers, {num_generations} generations/prompt"
+        f"Async {algorithm.upper()} (dynamic batching): {num_inference_workers} inference workers, "
+        f"{num_generations} generations/prompt"
     )
 
-    async def generate_experience():
-        nonlocal prompt_idx
+    # Create dynamic batcher for continuous dispatch and result caching
+    dynamic_batcher = DynamicBatcher(
+        workers=inference_workers,
+        dataset=dataset,
+        reward_fn=reward_fn,
+        minibatch_size=minibatch_size,
+        max_pending_per_worker=2,
+    )
 
-        while prompt_idx < len(dataset) and global_step < max_steps:
-            worker_samples = []
-            for _ in range(num_inference_workers):
-                batch_samples = []
-                for _ in range(batch_size_per_worker):
-                    if prompt_idx < len(dataset):
-                        batch_samples.append(dataset[prompt_idx])
-                        prompt_idx += 1
-                worker_samples.append(batch_samples)
+    # Start continuous dispatch to workers
+    dynamic_batcher.start()
 
-            futures = [
-                worker.generate_and_score.remote(ws, reward_fn)
-                for worker, ws in zip(inference_workers, worker_samples)
-                if ws
-            ]
+    pbar = tqdm(total=max_steps, initial=global_step, desc=f"Training {algorithm.upper()}")
 
-            for future in futures:
-                samples = await asyncio.wrap_future(future.future())
-                await asyncio.wrap_future(batcher.add_samples.remote(samples).future())
+    if not use_distributed:
+        model.train()
 
-            await asyncio.sleep(0.01)
-
-    async def train_loop():
-        nonlocal global_step, grad_accum_count, total_metrics
-
-        pbar = tqdm(total=max_steps, initial=global_step, desc=f"Training {algorithm.upper()}")
-
-        if not use_distributed:
-            model.train()
-
+    try:
         while global_step < max_steps:
-            batch = await asyncio.wrap_future(batcher.get_batch.remote(timeout=0.5).future())
+            # Get batch with staleness filtering and active sampling filter
+            batch_samples = await dynamic_batcher.get_batch(
+                timeout=1.0,
+                current_policy_version=dynamic_batcher.policy_version,
+                skip_zero_gradient=True,
+            )
 
-            if batch is None:
-                await asyncio.sleep(0.1)
+            if batch_samples is None:
+                if dynamic_batcher.is_exhausted:
+                    print("Dataset exhausted, stopping training")
+                    break
                 continue
 
+            batch = Minibatch(samples=batch_samples)
+
             if use_distributed:
-                # Distributed training: send batch to all workers
                 futures = [
                     worker.train_step.remote(
                         batch,
-                        None,  # optimizer state managed internally
+                        None,
                         algorithm,
                         clip_eps,
                         kl_coef,
@@ -655,7 +954,7 @@ async def train_async_rl(
                     for worker in training_workers
                 ]
                 results = await asyncio.gather(*[asyncio.wrap_future(f.future()) for f in futures])
-                metrics = results[0][0]  # Take metrics from rank 0
+                metrics = results[0][0]
             else:
                 loss, metrics = compute_rl_loss(
                     model=model,
@@ -706,6 +1005,8 @@ async def train_async_rl(
                         state_dict = {k: v.cpu() for k, v in model.state_dict().items()}
                     for worker in inference_workers:
                         worker.update_weights.remote(state_dict)
+                    # Increment policy version after weight sync
+                    await dynamic_batcher.increment_policy_version()
 
                 if global_step % config.save_steps == 0:
                     checkpoint_path = f"{config.output_dir}/checkpoint-{global_step}"
@@ -714,9 +1015,9 @@ async def train_async_rl(
                     tokenizer.save_pretrained(checkpoint_path)
                     print(f"Saved checkpoint to {checkpoint_path}")
 
+    finally:
+        await dynamic_batcher.stop()
         pbar.close()
-
-    await asyncio.gather(generate_experience(), train_loop())
 
     # Cleanup distributed workers
     if use_distributed:
@@ -725,4 +1026,8 @@ async def train_async_rl(
 
     ray.shutdown()
 
-    return {"global_step": global_step, "final_metrics": total_metrics}
+    return {
+        "global_step": global_step,
+        "final_metrics": total_metrics,
+        "batcher_stats": dynamic_batcher.stats,
+    }
