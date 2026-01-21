@@ -11,14 +11,20 @@ Supports: GRPO, PPO, GSPO
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import Any
 
-# Suppress Ray FutureWarning about accelerator env var override
+logger = logging.getLogger(__name__)
+
+# Suppress Ray warnings
 os.environ.setdefault("RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO", "0")
+os.environ.setdefault("RAY_DEDUP_LOGS", "0")
+os.environ.setdefault("RAY_ENABLE_RECORD_ACTOR_TASK_LOGGING", "0")
+os.environ.setdefault("RAY_metrics_report_interval_ms", "0")
 
 import ray  # noqa: E402
 import torch  # noqa: E402
@@ -541,7 +547,7 @@ class DynamicBatcher:
             self.stats["samples_generated"] += len(samples)
             await self.cache.push(samples)
         except Exception as e:
-            print(f"Worker {worker_idx} error: {e}")
+            logger.error(f"Worker {worker_idx} error: {e}")
         finally:
             self._worker_pending[worker_idx] -= 1
 
@@ -839,6 +845,7 @@ async def train_async_rl(
             _metrics_export_port=None,
             configure_logging=False,
             log_to_driver=False,
+            _system_config={"metrics_report_interval_ms": 0},
         )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -891,7 +898,7 @@ async def train_async_rl(
             )
             for i in range(num_training_workers)
         ]
-        print(
+        logger.info(
             f"Distributed training: {num_training_workers} workers with {distributed_backend.value.upper()}"
         )
     else:
@@ -910,9 +917,12 @@ async def train_async_rl(
         else len(dataset) // minibatch_size
     )
 
-    print(
+    # Get num_prompts_per_dispatch from config or use default
+    num_prompts_per_dispatch = getattr(config.training, "num_prompts_per_dispatch", 1)
+
+    logger.info(
         f"Async {algorithm.upper()} (dynamic batching): {num_inference_workers} inference workers, "
-        f"{num_generations} generations/prompt"
+        f"{num_generations} generations/prompt, {num_prompts_per_dispatch} prompts/dispatch"
     )
 
     # Create dynamic batcher for continuous dispatch and result caching
@@ -922,6 +932,7 @@ async def train_async_rl(
         reward_fn=reward_fn,
         minibatch_size=minibatch_size,
         max_pending_per_worker=2,
+        num_prompts_per_dispatch=num_prompts_per_dispatch,
     )
 
     # Start continuous dispatch to workers
@@ -943,7 +954,7 @@ async def train_async_rl(
 
             if batch_samples is None:
                 if dynamic_batcher.is_exhausted:
-                    print("Dataset exhausted, stopping training")
+                    logger.info("Dataset exhausted, stopping training")
                     break
                 continue
 
@@ -1022,7 +1033,7 @@ async def train_async_rl(
                     if not use_distributed:
                         model.save_pretrained(checkpoint_path)
                     tokenizer.save_pretrained(checkpoint_path)
-                    print(f"Saved checkpoint to {checkpoint_path}")
+                    logger.info(f"Saved checkpoint to {checkpoint_path}")
 
     finally:
         await dynamic_batcher.stop()

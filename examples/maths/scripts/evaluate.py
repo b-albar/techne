@@ -102,6 +102,7 @@ async def run_distributed_evaluation(args):
             _metrics_export_port=None,
             configure_logging=False,
             log_to_driver=False,
+            _system_config={"metrics_report_interval_ms": 0},
         )
 
     # Calculate resources

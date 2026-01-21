@@ -6,15 +6,20 @@ Generate SFT and distillation training data in parallel using Ray workers.
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-import ray
-import torch
+# Suppress Ray warnings
+os.environ.setdefault("RAY_DEDUP_LOGS", "0")
+os.environ.setdefault("RAY_metrics_report_interval_ms", "0")
 
-from techne.training.model import LocalModel
-from tqdm.asyncio import tqdm
+import ray  # noqa: E402
+import torch  # noqa: E402
+from tqdm.asyncio import tqdm  # noqa: E402
+
+from techne.training.model import LocalModel  # noqa: E402
 
 
 @dataclass
@@ -149,6 +154,7 @@ async def generate_sft_data(
             _metrics_export_port=None,
             configure_logging=False,
             log_to_driver=False,
+            _system_config={"metrics_report_interval_ms": 0},
         )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -230,6 +236,7 @@ async def generate_distill_data(
             _metrics_export_port=None,
             configure_logging=False,
             log_to_driver=False,
+            _system_config={"metrics_report_interval_ms": 0},
         )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
