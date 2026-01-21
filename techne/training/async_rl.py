@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from queue import Empty, Queue
@@ -469,6 +470,11 @@ class DynamicBatcher:
             "batches_skipped_zero_grad": 0,
         }
 
+        # Inference metrics tracking
+        self._start_time = time.time()
+        self._response_lengths: list[int] = []  # Track recent response lengths
+        self._max_response_history = 100  # Keep last N for moving average
+
     def start(self) -> None:
         """Start the continuous dispatch loop."""
         self._dispatch_task = asyncio.create_task(self._dispatch_loop())
@@ -545,6 +551,14 @@ class DynamicBatcher:
             # Compute advantages and push to cache immediately
             samples = compute_advantages(samples)
             self.stats["samples_generated"] += len(samples)
+
+            # Track response lengths for metrics
+            for s in samples:
+                self._response_lengths.append(len(s.completion_ids))
+            # Keep only recent history
+            if len(self._response_lengths) > self._max_response_history:
+                self._response_lengths = self._response_lengths[-self._max_response_history:]
+
             await self.cache.push(samples)
         except Exception as e:
             logger.error(f"Worker {worker_idx} error: {e}")
@@ -616,6 +630,36 @@ class DynamicBatcher:
             and all(p == 0 for p in self._worker_pending.values())
             and self.cache.pending_count() < self.minibatch_size
         )
+
+    def get_inference_metrics(self) -> dict[str, float]:
+        """Get current inference metrics for progress display."""
+        elapsed = time.time() - self._start_time
+        samples_generated = self.stats["samples_generated"]
+
+        # Samples per second
+        samples_per_sec = samples_generated / elapsed if elapsed > 0 else 0.0
+
+        # Average response length (from recent samples)
+        avg_resp_len = (
+            sum(self._response_lengths) / len(self._response_lengths)
+            if self._response_lengths
+            else 0.0
+        )
+
+        # Pending samples in cache
+        pending = self.cache.pending_count()
+
+        # Active workers (those with pending tasks)
+        active_workers = sum(1 for p in self._worker_pending.values() if p > 0)
+
+        return {
+            "gen/s": round(samples_per_sec, 1),
+            "resp_len": round(avg_resp_len, 0),
+            "pending": pending,
+            "active": active_workers,
+            "stale": self.stats["samples_dropped_stale"],
+            "skipped": self.stats["batches_skipped_zero_grad"],
+        }
 
 
 @ray.remote
@@ -1011,10 +1055,17 @@ async def train_async_rl(
                 pbar.update(1)
                 grad_accum_count = 0
 
+                # Update progress bar with combined training + inference metrics
+                inference_metrics = dynamic_batcher.get_inference_metrics()
                 if global_step % config.logging_steps == 0:
                     avg_metrics = {k: v / config.logging_steps for k, v in total_metrics.items()}
-                    pbar.set_postfix(avg_metrics)
+                    # Combine training and inference metrics
+                    combined_metrics = {**avg_metrics, **inference_metrics}
+                    pbar.set_postfix(combined_metrics)
                     total_metrics = {}
+                else:
+                    # Still show inference metrics between logging steps
+                    pbar.set_postfix(inference_metrics)
 
                 if config.training.sync_weights and global_step % sync_weights_interval == 0:
                     if use_distributed:
