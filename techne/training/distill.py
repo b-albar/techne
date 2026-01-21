@@ -42,45 +42,6 @@ def are_tokenizers_identical(
     return s_enc == t_enc
 
 
-def compute_kl_loss(
-    student_logits: torch.Tensor,
-    teacher_logits: torch.Tensor,
-    temperature: float = 2.0,
-    valid_length: int | None = None,
-) -> torch.Tensor:
-    """Compute KL divergence loss between student and teacher logits.
-
-    Args:
-        student_logits: Student model logits [batch, seq, vocab]
-        teacher_logits: Teacher model logits [batch, seq, vocab]
-        temperature: Softmax temperature for softer distributions
-        valid_length: Optional length to truncate both to (for alignment)
-
-    Returns:
-        KL divergence loss (scalar)
-    """
-    # Align sequence lengths if needed
-    if valid_length is not None:
-        student_logits = student_logits[:, :valid_length, :]
-        teacher_logits = teacher_logits[:, :valid_length, :]
-
-    # Handle vocabulary size mismatch
-    student_vocab = student_logits.shape[-1]
-    teacher_vocab = teacher_logits.shape[-1]
-
-    if student_vocab != teacher_vocab:
-        min_vocab = min(student_vocab, teacher_vocab)
-        student_logits = student_logits[:, :, :min_vocab]
-        teacher_logits = teacher_logits[:, :, :min_vocab]
-
-    # Compute KL divergence with temperature scaling
-    student_probs = F.log_softmax(student_logits / temperature, dim=-1)
-    teacher_probs = F.softmax(teacher_logits / temperature, dim=-1)
-
-    kl_loss = F.kl_div(student_probs, teacher_probs, reduction="batchmean")
-    return kl_loss * (temperature**2)
-
-
 # =============================================================================
 # Offline Distillation Training
 # =============================================================================
