@@ -97,7 +97,12 @@ class EvaluationWorker:
 async def run_distributed_evaluation(args):
     # 1. Initialize Ray
     if not ray.is_initialized():
-        ray.init()
+        ray.init(
+            include_dashboard=False,
+            _metrics_export_port=None,
+            configure_logging=False,
+            log_to_driver=False,
+        )
 
     # Calculate resources
     num_workers = args.parallel

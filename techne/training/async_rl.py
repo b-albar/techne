@@ -11,19 +11,23 @@ Supports: GRPO, PPO, GSPO
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import Any
 
-import ray
-import torch
-import torch.nn.functional as F  # noqa: N812
-from transformers import AutoModelForCausalLM, AutoTokenizer
+# Suppress Ray FutureWarning about accelerator env var override
+os.environ.setdefault("RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO", "0")
 
-from techne.config import DistributedBackend, TechneConfig
-from techne.training.model import LocalModel
-from tqdm.auto import tqdm
+import ray  # noqa: E402
+import torch  # noqa: E402
+import torch.nn.functional as F  # noqa: E402, N812
+from tqdm.auto import tqdm  # noqa: E402
+from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: E402
+
+from techne.config import DistributedBackend, TechneConfig  # noqa: E402
+from techne.training.model import LocalModel  # noqa: E402
 
 
 @dataclass
@@ -830,7 +834,12 @@ async def train_async_rl(
     sync_weights_interval = config.training.sync_weights_interval
 
     if not ray.is_initialized():
-        ray.init()
+        ray.init(
+            include_dashboard=False,
+            _metrics_export_port=None,
+            configure_logging=False,
+            log_to_driver=False,
+        )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     use_distributed = num_training_workers > 1 and distributed_backend != DistributedBackend.NONE

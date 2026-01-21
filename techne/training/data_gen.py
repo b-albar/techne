@@ -144,7 +144,12 @@ async def generate_sft_data(
         List of generated samples
     """
     if not ray.is_initialized():
-        ray.init()
+        ray.init(
+            include_dashboard=False,
+            _metrics_export_port=None,
+            configure_logging=False,
+            log_to_driver=False,
+        )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -220,7 +225,12 @@ async def generate_distill_data(
         List of generated samples with teacher logprobs
     """
     if not ray.is_initialized():
-        ray.init()
+        ray.init(
+            include_dashboard=False,
+            _metrics_export_port=None,
+            configure_logging=False,
+            log_to_driver=False,
+        )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
