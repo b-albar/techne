@@ -23,6 +23,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from techne.config import DistributedBackend, TechneConfig
 from techne.training.model import LocalModel
+from tqdm.auto import tqdm
 
 
 @dataclass
@@ -627,6 +628,8 @@ async def train_async_rl(
     async def train_loop():
         nonlocal global_step, grad_accum_count, total_metrics
 
+        pbar = tqdm(total=max_steps, initial=global_step, desc=f"Training {algorithm.upper()}")
+
         if not use_distributed:
             model.train()
 
@@ -686,11 +689,12 @@ async def train_async_rl(
                     optimizer.zero_grad()
 
                 global_step += 1
+                pbar.update(1)
                 grad_accum_count = 0
 
                 if global_step % config.logging_steps == 0:
                     avg_metrics = {k: v / config.logging_steps for k, v in total_metrics.items()}
-                    print(f"Step {global_step}: {avg_metrics}")
+                    pbar.set_postfix(avg_metrics)
                     total_metrics = {}
 
                 if config.training.sync_weights and global_step % sync_weights_interval == 0:
@@ -709,6 +713,8 @@ async def train_async_rl(
                         model.save_pretrained(checkpoint_path)
                     tokenizer.save_pretrained(checkpoint_path)
                     print(f"Saved checkpoint to {checkpoint_path}")
+
+        pbar.close()
 
     await asyncio.gather(generate_experience(), train_loop())
 

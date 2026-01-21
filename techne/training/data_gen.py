@@ -14,6 +14,7 @@ import ray
 import torch
 
 from techne.training.model import LocalModel
+from tqdm.asyncio import tqdm
 
 
 @dataclass
@@ -161,6 +162,7 @@ async def generate_sft_data(
 
     all_samples: list[GeneratedSample] = []
     prompt_idx = 0
+    pbar = tqdm(total=len(prompts), desc="Generating SFT Data")
 
     while prompt_idx < len(prompts):
         # Distribute prompts to workers
@@ -174,10 +176,12 @@ async def generate_sft_data(
         # Collect results
         for future in futures:
             samples = await asyncio.wrap_future(future.future())
+            pbar.update(len(samples))
             if filter_fn:
                 samples = [s for s in samples if filter_fn(s)]
             all_samples.extend(samples)
 
+    pbar.close()
     ray.shutdown()
     return all_samples
 
@@ -246,6 +250,7 @@ async def generate_distill_data(
     pending_samples: list[GeneratedSample] = []
     prompt_idx = 0
     teacher_idx = 0
+    pbar = tqdm(total=len(prompts), desc="Generating Distillation Data")
 
     async def process_with_teacher(samples: list[GeneratedSample]) -> list[GeneratedSample]:
         nonlocal teacher_idx
@@ -267,8 +272,10 @@ async def generate_distill_data(
         # Collect generated samples
         for future in gen_futures:
             samples = await asyncio.wrap_future(future.future())
+            orig_len = len(samples)
             if filter_fn:
                 samples = [s for s in samples if filter_fn(s)]
+            pbar.update(orig_len - len(samples))
             pending_samples.extend(samples)
 
         # Process with teacher in batches
@@ -277,12 +284,15 @@ async def generate_distill_data(
             pending_samples = pending_samples[batch_size:]
             scored = await process_with_teacher(batch)
             all_samples.extend(scored)
+            pbar.update(len(scored))
 
     # Process remaining samples
     if pending_samples:
         scored = await process_with_teacher(pending_samples)
         all_samples.extend(scored)
+        pbar.update(len(scored))
 
+    pbar.close()
     ray.shutdown()
     return all_samples
 
