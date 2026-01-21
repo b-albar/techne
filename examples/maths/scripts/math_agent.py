@@ -114,7 +114,7 @@ class MathToolAgent(Agent):
                     dtype=dtype,
                 )
             if self.config.model.compile and hasattr(torch, "compile"):
-                self.model = torch.compile(self.model)
+                self.model.forward = torch.compile(self.model.forward)
         else:
             self.backend = "openai"
             try:
