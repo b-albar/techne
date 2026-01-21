@@ -1,26 +1,15 @@
-"""Train a Math Tool Agent using distillation.
-
-This script demonstrates offline distillation where a smaller student
-model learns from a larger teacher model's outputs.
-
-Usage:
-    python train_distill.py --config ../configs/distill.yaml --dataset ../data/sft
-"""
-
 import argparse
 import asyncio
 import os
 
-from datasets import load_from_disk
-
-from techne.config import TechneConfig
+from techne.config import TechneConfig, TrainingAlgorithm
 from techne.training.trainer import TechneTrainer
 
 
 async def main():
-    parser = argparse.ArgumentParser(description="Train using distillation")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="examples/maths/configs/distill.yaml")
-    parser.add_argument("--dataset", type=str, default="examples/maths/data/sft")
+    parser.add_argument("--dataset", type=str, default="examples/maths/data/rl")
     args = parser.parse_args()
 
     # 1. Load Config
@@ -28,57 +17,51 @@ async def main():
     if not os.path.exists(config_path):
         if os.path.exists(f"../{config_path}"):
             config_path = f"../{config_path}"
-        elif os.path.exists("../configs/distill.yaml"):
-            config_path = "../configs/distill.yaml"
+        elif os.path.exists(os.path.basename(config_path)):
+            config_path = os.path.basename(config_path)
         else:
             raise FileNotFoundError(f"Config file not found: {args.config}")
 
     config = TechneConfig.from_yaml(config_path)
-    print(f"Loaded config: {config_path}")
-    print(f"  Student model: {config.model.name_or_path}")
-    print(f"  Teacher model: {config.training.teacher_model}")
-    print(f"  Algorithm: {config.training.algorithm}")
 
-    # 2. Load Dataset
-    print(f"\nLoading dataset from {args.dataset}...")
+    # Ensure algorithm is DISTILL
+    if config.training.algorithm != TrainingAlgorithm.DISTILL:
+        print(f"Warning: Config algorithm is {config.training.algorithm}, overriding to DISTILL")
+        config.training.algorithm = TrainingAlgorithm.DISTILL
+
+    # 2. Load Data
+    print(f"Loading dataset from {args.dataset}...")
+    from datasets import load_from_disk
+
     try:
         data_path = args.dataset
         if not os.path.exists(data_path):
+            # Try relative paths
             if os.path.exists(f"../{data_path}"):
                 data_path = f"../{data_path}"
-            elif os.path.exists("../data/sft"):
-                data_path = "../data/sft"
+            elif os.path.exists("../data/rl"):
+                data_path = "../data/rl"
 
         ds = load_from_disk(data_path)
-        if hasattr(ds, "keys") and "train" in ds:
-            ds = ds["train"]
     except Exception as e:
         print(f"Error loading dataset: {e}")
         exit(1)
 
-    print(f"  Dataset size: {len(ds)} samples")
-
     # 3. Initialize Trainer
     trainer = TechneTrainer(config)
 
-    # 4. Preprocess dataset (same as SFT)
-    from math_agent import MathToolAgent
+    # 4. Start Distillation
+    # For on-policy distillation, we pass the dataset.
+    # The trainer will use _create_kl_reward_fn internally since algo is DISTILL.
+    # We don't implement a custom reward function here.
 
-    agent = MathToolAgent(config, model=None, tokenizer=trainer.tokenizer)
+    train_ds = ds["train"]
+    # We might want to limit dataset size for testing
+    # train_ds = train_ds.select(range(100))
 
-    def preprocess_incremental(sample):
-        """Use agent's tokenize_messages for consistent incremental tokenization."""
-        messages = sample["prompt"]
-        return agent.tokenize_messages(messages)
-
-    # Select subset and tokenize
-    train_dataset = ds.select(range(min(100, len(ds))))
-    print(f"\nTokenizing {len(train_dataset)} samples...")
-    train_dataset = train_dataset.map(preprocess_incremental, remove_columns=["prompt"])
-
-    # 5. Train
-    print(f"\nStarting distillation training...")
-    await trainer.train(train_dataset)
+    await trainer.train(
+        dataset=train_ds,
+    )
 
 
 if __name__ == "__main__":

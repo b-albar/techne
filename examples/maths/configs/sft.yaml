@@ -5,6 +5,7 @@ model:
   dtype: "bfloat16"
   attn_implementation: "sdpa"
   trust_remote_code: true
+  compile: true
   lora:
     enabled: true
     r: 64
@@ -22,14 +23,13 @@ model:
 training:
   algorithm: "sft"
   learning_rate: 2e-5
-  batch_size: 1  # Reduced for smaller GPU
-  gradient_accumulation_steps: 8
+  batch_size: 2
+  gradient_accumulation_steps: 32
   max_seq_length: 2048  # Limit sequence length
   num_train_epochs: 6
   warmup_ratio: 0.1
   weight_decay: 0.01
   max_grad_norm: 1.0
-  max_steps: 50  # Quick test
 
 output_dir: "./output/sft"
 seed: 42

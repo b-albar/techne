@@ -46,23 +46,35 @@ async def main():
     # 3. Initialize Trainer
     trainer = TechneTrainer(config)
 
-    # 4. Initialize Agent (On-policy)
-    agent = MathToolAgent(config, model=trainer.model, tokenizer=trainer.tokenizer)
-    reward_fn = MathReward()
-
-    # 5. Start Training Loop
     train_ds = ds["train"]
 
-    # Preprocess dataset to ensure it has 'ground_truth' column at top level
+    # Preprocess dataset if it has nested reward_model
     if "reward_model" in train_ds.column_names and "ground_truth" not in train_ds.column_names:
         print("Preprocessing dataset to extract ground truths...")
         train_ds = train_ds.map(lambda x: {"ground_truth": x["reward_model"]["ground_truth"]})
 
-    # 5. Start Training Loop
+    # 4. Prepare Reward Function
+    # The new async RL passes (prompt, completion) to the reward function.
+    # We use a lookup table to find the ground truth for each prompt.
+    def reward_fn_wrapper(sample: dict, completion: str) -> float:
+        gt = sample.get("ground_truth")
+        if gt is None:
+            # Fallback if nested in reward_model (should be handled by preprocessing but just in case)
+            if "reward_model" in sample and isinstance(sample["reward_model"], dict):
+                gt = sample["reward_model"].get("ground_truth")
+
+        if gt is None:
+            return 0.0
+
+        predicted = MathReward.extract_answer(completion)
+        return 1.0 if MathReward.is_correct(predicted, gt) else 0.0
+
+    # 5. Start Async Training
+    # We pass the class MathToolAgent because workers will instantiate it themselves.
     await trainer.train(
-        agent=agent,
         dataset=train_ds,
-        reward_fn=reward_fn,
+        reward_fn=reward_fn_wrapper,
+        agent_class=MathToolAgent,
     )
 
 
