@@ -22,6 +22,7 @@ import torch.nn.functional as F  # noqa: N812
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from techne.config import DistributedBackend, TechneConfig
+from techne.training.model import LocalModel
 
 
 @dataclass
@@ -52,7 +53,7 @@ class InferenceWorker:
         self,
         model_name: str,
         device: str = "cuda",
-        dtype: str = "bfloat16",
+        dtype: torch.dtype = torch.bfloat16,
         num_generations: int = 4,
         max_new_tokens: int = 512,
         temperature: float = 0.7,
@@ -66,19 +67,12 @@ class InferenceWorker:
         self.agent_class = agent_class
         self.agent_config = agent_config
 
-        torch_dtype = torch.bfloat16 if dtype == "bfloat16" else torch.float16
-
-        self.model = AutoModelForCausalLM.from_pretrained(
+        self.model = LocalModel.from_pretrained(
             model_name,
-            torch_dtype=torch_dtype,
-            device_map=device,
-            trust_remote_code=True,
+            device=device,
+            dtype=dtype,
         )
-        self.model.eval()
-
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer = self.model.tokenizer
 
         # Initialize agent if class provided
         if self.agent_class:
@@ -131,7 +125,7 @@ class InferenceWorker:
                             completion_ids.extend(step.token_ids)
                             completion_text += step.content
 
-                    ref_logprobs = self._compute_logprobs(prompt_ids, completion_ids)
+                    ref_logprobs = self.model.compute_logprobs(prompt_ids, completion_ids)
 
                     reward = 0.0
                     if reward_fn:
@@ -166,7 +160,7 @@ class InferenceWorker:
                 for seq in outputs.sequences:
                     completion_ids = seq[len(prompt_ids) :].tolist()
                     completion = self.tokenizer.decode(completion_ids, skip_special_tokens=True)
-                    ref_logprobs = self._compute_logprobs(prompt_ids, completion_ids)
+                    ref_logprobs = self.model.compute_logprobs(prompt_ids, completion_ids)
 
                     reward = 0.0
                     if reward_fn:
@@ -188,28 +182,6 @@ class InferenceWorker:
 
         return ret_samples
 
-    def _compute_logprobs(self, prompt_ids: list[int], completion_ids: list[int]) -> list[float]:
-        """Compute log probabilities for completion tokens."""
-        if not completion_ids:
-            return []
-
-        input_ids = torch.tensor([prompt_ids + completion_ids], device=self.device)
-
-        with torch.no_grad():
-            outputs = self.model(input_ids)
-            logits = outputs.logits
-
-        start_idx = len(prompt_ids) - 1
-        end_idx = start_idx + len(completion_ids)
-
-        completion_logits = logits[0, start_idx:end_idx]
-        log_probs = F.log_softmax(completion_logits, dim=-1)
-
-        completion_tensor = torch.tensor(completion_ids, device=self.device)
-        token_logprobs = log_probs.gather(1, completion_tensor.unsqueeze(1)).squeeze(1)
-
-        return token_logprobs.tolist()
-
     def update_weights(self, state_dict: dict):
         """Update model weights from trainer."""
         self.model.load_state_dict(state_dict)
@@ -224,7 +196,7 @@ class TrainingWorker:
         model_name: str,
         rank: int,
         world_size: int,
-        dtype: str = "bfloat16",
+        dtype: torch.dtype = torch.bfloat16,
         distributed_backend: DistributedBackend = DistributedBackend.NONE,
     ):
         import os
@@ -232,8 +204,6 @@ class TrainingWorker:
         self.rank = rank
         self.world_size = world_size
         self.distributed_backend = distributed_backend
-
-        torch_dtype = torch.bfloat16 if dtype == "bfloat16" else torch.float16
 
         if distributed_backend == DistributedBackend.FSDP:
             os.environ["RANK"] = str(rank)
@@ -246,7 +216,7 @@ class TrainingWorker:
 
             base_model = AutoModelForCausalLM.from_pretrained(
                 model_name,
-                torch_dtype=torch_dtype,
+                dtype=dtype,
                 trust_remote_code=True,
             )
             self.model = FSDP(base_model.cuda())
@@ -259,14 +229,14 @@ class TrainingWorker:
 
             base_model = AutoModelForCausalLM.from_pretrained(
                 model_name,
-                torch_dtype=torch_dtype,
+                dtype=dtype,
                 trust_remote_code=True,
             ).cuda(rank)
             self.model = torch.nn.parallel.DistributedDataParallel(base_model, device_ids=[rank])
         else:
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_name,
-                torch_dtype=torch_dtype,
+                dtype=dtype,
                 device_map="cuda",
                 trust_remote_code=True,
             )

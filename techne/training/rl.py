@@ -69,20 +69,19 @@ async def train_rl(
 
 def _create_kl_reward_fn(config: TechneConfig, student_tokenizer):
     """Create KL-based reward function for on-policy distillation."""
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from techne.training.model import create_teacher_model
 
     teacher_model_path = config.training.teacher_model
     if not teacher_model_path:
         raise ValueError("On-policy distillation requires teacher_model in config")
 
     print(f"Loading teacher model: {teacher_model_path}...")
-    teacher_model = AutoModelForCausalLM.from_pretrained(
+    teacher_model = create_teacher_model(
         teacher_model_path,
-        device_map="auto",
-        torch_dtype=torch.bfloat16 if config.model.dtype == "bfloat16" else torch.float16,
+        device="auto",  # device_map="auto" handled by LocalModel
+        dtype=config.model.dtype,
     )
-    teacher_tokenizer = AutoTokenizer.from_pretrained(teacher_model_path)
+    teacher_tokenizer = teacher_model.tokenizer
 
     from techne.training.distill import compute_distillation_reward
 

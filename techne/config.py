@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from enum import Enum
 from pathlib import Path
+from typing import Any
 
+import torch
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class TrainingAlgorithm(str, Enum):
@@ -49,12 +51,30 @@ class LoRAConfig(BaseModel):
 
 
 class ModelConfig(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     name_or_path: str
-    dtype: str = Field(default="bfloat16")
+    dtype: Any = Field(default=torch.bfloat16)
     attn_implementation: str = Field(default="flash_attention_2")
     trust_remote_code: bool = Field(default=True)
     compile: bool = Field(default=False)
     lora: LoRAConfig = Field(default_factory=LoRAConfig)
+
+    @field_validator("dtype", mode="before")
+    @classmethod
+    def parse_dtype(cls, v):
+        if isinstance(v, torch.dtype):
+            return v
+        if isinstance(v, str):
+            if v == "bfloat16":
+                return torch.bfloat16
+            if v == "float16":
+                return torch.float16
+            if v == "float32":
+                return torch.float32
+            if v == "auto":
+                return "auto"
+        return v
 
 
 class TrainingConfig(BaseModel):

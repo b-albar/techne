@@ -8,7 +8,6 @@ Training types:
 
 from typing import Any
 
-import torch
 from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -28,7 +27,7 @@ class TechneTrainer:
         self.model = AutoModelForCausalLM.from_pretrained(
             config.model.name_or_path,
             trust_remote_code=config.model.trust_remote_code,
-            dtype=torch.bfloat16 if config.model.dtype == "bfloat16" else torch.float16,
+            dtype=config.model.dtype,
             attn_implementation=config.model.attn_implementation,
             device_map="auto",
         )

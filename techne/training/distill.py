@@ -10,7 +10,7 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizer
+from transformers import PreTrainedModel, PreTrainedTokenizer
 from trl import SFTConfig, SFTTrainer
 
 from techne.config import DistillationMode, TechneConfig
@@ -21,6 +21,7 @@ from techne.training.estimators import (
     SparseLogits,
 )
 from techne.training.sft import get_common_training_args, get_sft_trainer
+from techne.training.model import create_teacher_model
 
 # =============================================================================
 # Tokenizer Alignment Utilities
@@ -97,13 +98,12 @@ def train_distill_offline(
 
     # Load teacher model and tokenizer
     print(f"Loading teacher model for logit distillation: {teacher_model_path}...")
-    teacher_model = AutoModelForCausalLM.from_pretrained(
+    teacher_model = create_teacher_model(
         teacher_model_path,
-        device_map="auto",
-        dtype=torch.bfloat16 if config.model.dtype == "bfloat16" else torch.float16,
+        device="auto",
+        dtype=config.model.dtype,
     )
-    teacher_model.eval()
-    teacher_tokenizer = AutoTokenizer.from_pretrained(teacher_model_path)
+    teacher_tokenizer = teacher_model.tokenizer
 
     # Check if tokenizers are identical
     same_tokenizer = are_tokenizers_identical(tokenizer, teacher_tokenizer)

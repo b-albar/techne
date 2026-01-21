@@ -12,8 +12,8 @@ from typing import Any
 
 import ray
 import torch
-import torch.nn.functional as F
-from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from techne.training.model import LocalModel
 
 
 @dataclass
@@ -38,7 +38,7 @@ class GenerationWorker:
         self,
         model_name: str,
         device: str = "cuda",
-        dtype: str = "bfloat16",
+        dtype: torch.dtype = torch.bfloat16,
         max_new_tokens: int = 512,
         temperature: float = 0.7,
         top_p: float = 0.95,
@@ -48,19 +48,12 @@ class GenerationWorker:
         self.temperature = temperature
         self.top_p = top_p
 
-        torch_dtype = torch.bfloat16 if dtype == "bfloat16" else torch.float16
-
-        self.model = AutoModelForCausalLM.from_pretrained(
+        self.model = LocalModel.from_pretrained(
             model_name,
-            torch_dtype=torch_dtype,
-            device_map=device,
-            trust_remote_code=True,
+            device=device,
+            dtype=dtype,
         )
-        self.model.eval()
-
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer = self.model.tokenizer
 
     def generate(self, prompts: list[str]) -> list[GeneratedSample]:
         """Generate completions for prompts."""
@@ -103,54 +96,22 @@ class TeacherWorker:
         self,
         model_name: str,
         device: str = "cuda",
-        dtype: str = "bfloat16",
+        dtype: torch.dtype = torch.bfloat16,
     ):
         self.device = device
-        torch_dtype = torch.bfloat16 if dtype == "bfloat16" else torch.float16
-
-        self.model = AutoModelForCausalLM.from_pretrained(
+        self.model = LocalModel.from_pretrained(
             model_name,
-            torch_dtype=torch_dtype,
-            device_map=device,
-            trust_remote_code=True,
+            device=device,
+            dtype=dtype,
         )
-        self.model.eval()
-
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer = self.model.tokenizer
 
     def compute_logprobs(self, samples: list[GeneratedSample]) -> list[GeneratedSample]:
         """Compute teacher logprobs for completions."""
         for sample in samples:
-            full_text = sample.prompt + sample.completion
-            inputs = self.tokenizer(full_text, return_tensors="pt").to(self.device)
-
-            with torch.no_grad():
-                outputs = self.model(inputs.input_ids)
-                logits = outputs.logits
-
-            # Get logprobs for completion tokens
-            prompt_len = len(self.tokenizer(sample.prompt).input_ids)
-            completion_len = inputs.input_ids.shape[1] - prompt_len
-
-            if completion_len > 0:
-                # logits[i] predicts token[i+1], so for completion starting at prompt_len
-                # we need logits from prompt_len-1 to end-1
-                start_idx = prompt_len - 1
-                end_idx = inputs.input_ids.shape[1] - 1
-
-                completion_logits = logits[0, start_idx:end_idx]
-                log_probs = F.log_softmax(completion_logits, dim=-1)
-
-                # Get actual completion token ids
-                completion_token_ids = inputs.input_ids[0, prompt_len:]
-                token_logprobs = log_probs.gather(1, completion_token_ids.unsqueeze(1)).squeeze(1)
-
-                sample.teacher_logprobs = token_logprobs.tolist()
-            else:
-                sample.teacher_logprobs = []
-
+            sample.teacher_logprobs = self.model.compute_logprobs(
+                sample.prompt_ids, sample.completion_ids
+            )
         return samples
 
 
@@ -162,7 +123,7 @@ async def generate_sft_data(
     max_new_tokens: int = 512,
     temperature: float = 0.7,
     top_p: float = 0.95,
-    dtype: str = "bfloat16",
+    dtype: torch.dtype = torch.bfloat16,
     filter_fn: Callable[[GeneratedSample], bool] | None = None,
 ) -> list[GeneratedSample]:
     """Generate SFT training data using Ray workers.
@@ -231,7 +192,7 @@ async def generate_distill_data(
     max_new_tokens: int = 512,
     temperature: float = 0.7,
     top_p: float = 0.95,
-    dtype: str = "bfloat16",
+    dtype: torch.dtype = torch.bfloat16,
     filter_fn: Callable[[GeneratedSample], bool] | None = None,
 ) -> list[GeneratedSample]:
     """Generate distillation training data using Ray workers.

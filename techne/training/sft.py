@@ -2,6 +2,7 @@
 
 from typing import Any
 
+import torch
 from trl import SFTConfig, SFTTrainer
 
 from techne.config import TechneConfig, TrainingAlgorithm
@@ -73,7 +74,7 @@ def get_common_training_args(config: TechneConfig) -> dict:
         "warmup_ratio": config.training.warmup_ratio,
         "weight_decay": config.training.weight_decay,
         "max_grad_norm": config.training.max_grad_norm,
-        "bf16": config.model.dtype == "bfloat16",
+        "bf16": config.model.dtype == torch.bfloat16,
         "report_to": config.training.report_to,
         "logging_steps": config.logging_steps,
         "save_steps": config.save_steps,
