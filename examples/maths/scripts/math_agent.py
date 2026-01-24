@@ -104,9 +104,13 @@ class MathToolAgent(Agent):
 
                 # Get dtype from config or default to bfloat16
                 model_dtype = getattr(self.config.model, "dtype", "bfloat16")
-                dtype = (
-                    getattr(torch, model_dtype) if hasattr(torch, model_dtype) else torch.bfloat16
-                )
+                # Handle both string and torch.dtype
+                if isinstance(model_dtype, torch.dtype):
+                    dtype = model_dtype
+                elif isinstance(model_dtype, str) and hasattr(torch, model_dtype):
+                    dtype = getattr(torch, model_dtype)
+                else:
+                    dtype = torch.bfloat16
 
                 self.model = AutoModelForCausalLM.from_pretrained(
                     self.model_name,
@@ -126,6 +130,9 @@ class MathToolAgent(Agent):
                 )
             except ImportError:
                 print("Warning: openai package not installed. OpenAI backend will not work.")
+
+        # Lock for async generation serialization
+        self.lock = asyncio.Lock()
 
     def tokenize_messages(self, messages: list[dict], max_length: int = 4096) -> dict:
         """Tokenize messages incrementally (message-by-message concat).
@@ -258,7 +265,8 @@ class MathToolAgent(Agent):
             if self.backend == "openai":
                 text, meta = await self._generate_openai(context)
             else:
-                text, meta = await asyncio.to_thread(self._generate_hf, context)
+                async with self.lock:
+                    text, meta = await asyncio.to_thread(self._generate_hf, context)
 
             # 2. Add Assistant Step
             add_turn(

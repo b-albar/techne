@@ -56,8 +56,6 @@ async def main():
     # We don't implement a custom reward function here.
 
     train_ds = ds["train"]
-    # We might want to limit dataset size for testing
-    # train_ds = train_ds.select(range(100))
 
     await trainer.train(
         dataset=train_ds,

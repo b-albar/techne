@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -80,6 +81,88 @@ class Trajectory(BaseModel):
         """Get the full text content of the trajectory."""
         return "".join(s.content for s in self.steps)
 
+    def to_training_sample(
+        self,
+        label_mask_value: int = -100,
+        tokenizer: Any | None = None,
+    ) -> "TrainingSample":
+        """Convert trajectory to a flat, token-aligned training sample.
+
+        Args:
+            label_mask_value: Value to use for masked (non-trainable) positions in labels.
+            tokenizer: Optional tokenizer for fallback if step.token_ids is None.
+
+        Returns:
+            TrainingSample with flattened token-level data.
+
+        Raises:
+            ValueError: If steps don't have token_ids and no tokenizer provided.
+        """
+        input_ids: list[int] = []
+        labels: list[int] = []
+        rewards: list[float] = []
+        values: list[float] = []
+        log_probs: list[float] = []
+
+        has_rewards = False
+        has_values = False
+        has_log_probs = False
+
+        for step in self.steps:
+            if step.token_ids is not None:
+                tokens = step.token_ids
+            elif tokenizer is not None:
+                tokens = tokenizer.encode(step.content, add_special_tokens=False)
+            else:
+                raise ValueError(
+                    "Step must have token_ids populated or tokenizer must be provided"
+                )
+
+            n_tokens = len(tokens)
+            input_ids.extend(tokens)
+
+            # Labels: mask non-trainable steps
+            if step.trainable:
+                labels.extend(tokens)
+            else:
+                labels.extend([label_mask_value] * n_tokens)
+
+            # Rewards: assign to last token of the step (common convention)
+            if step.reward is not None:
+                has_rewards = True
+                rewards.extend([0.0] * (n_tokens - 1) + [step.reward])
+            else:
+                rewards.extend([0.0] * n_tokens)
+
+            # Values: broadcast step value across all tokens
+            if step.value is not None:
+                has_values = True
+                values.extend([step.value] * n_tokens)
+            else:
+                values.extend([0.0] * n_tokens)
+
+            # Log probs: must match token count
+            if step.log_probs is not None:
+                has_log_probs = True
+                if len(step.log_probs) != n_tokens:
+                    raise ValueError(
+                        f"Step log_probs length ({len(step.log_probs)}) != "
+                        f"token_ids length ({n_tokens})"
+                    )
+                log_probs.extend(step.log_probs)
+            else:
+                log_probs.extend([0.0] * n_tokens)
+
+        return TrainingSample(
+            input_ids=input_ids,
+            labels=labels,
+            rewards=rewards if has_rewards else None,
+            values=values if has_values else None,
+            advantages=None,  # Computed separately (e.g., GAE)
+            log_probs=log_probs if has_log_probs else None,
+            metadata={"trajectory_metadata": self.metadata},
+        )
+
 
 class TrainingSample(BaseModel):
     """A single processed sample ready for the model training loop.
@@ -105,3 +188,20 @@ class TrainingSample(BaseModel):
     metadata: dict[str, Any] = Field(
         default_factory=dict, description="Trace back to original trajectory/step."
     )
+
+
+def save_trajectories(trajectories: list[Trajectory], path: str | Path):
+    """Save a list of trajectories to a JSONL file."""
+    with open(path, "w", encoding="utf-8") as f:
+        for t in trajectories:
+            f.write(t.model_dump_json() + "\n")
+
+
+def load_trajectories(path: str | Path) -> list[Trajectory]:
+    """Load a list of trajectories from a JSONL file."""
+    trajectories = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                trajectories.append(Trajectory.model_validate_json(line))
+    return trajectories

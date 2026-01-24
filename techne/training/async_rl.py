@@ -37,6 +37,36 @@ from techne.config import DistributedBackend, TechneConfig  # noqa: E402
 from techne.training.model import LocalModel  # noqa: E402
 
 
+def get_merged_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """Get state dict from model, merging LoRA weights if present.
+
+    When the trainer uses LoRA (via peft), the state dict has keys prefixed with
+    'base_model.model.' and includes LoRA adapter weights. Inference workers use
+    plain HuggingFace models without LoRA. This function merges LoRA weights into
+    the base model and returns a state dict compatible with plain HF models.
+    """
+    # Check if this is a peft model with LoRA adapters
+    if hasattr(model, "merge_and_unload"):
+        # This is a peft model - we need to merge LoRA weights
+        # Use merge_adapter() to merge without unloading, then get state dict
+        # from the underlying base model
+        try:
+            # Merge LoRA weights into base model weights
+            model.merge_adapter()
+            # Get state dict from the base model (without 'base_model.model.' prefix)
+            base_model = model.get_base_model()
+            state_dict = {k: v.cpu() for k, v in base_model.state_dict().items()}
+            # Unmerge so training can continue
+            model.unmerge_adapter()
+            return state_dict
+        except Exception as e:
+            logger.warning(f"Failed to merge LoRA adapter: {e}. Falling back to direct state dict.")
+            # Fall through to default behavior
+
+    # Standard model - just return state dict
+    return {k: v.cpu() for k, v in model.state_dict().items()}
+
+
 @dataclass
 class Sample:
     """A single generated sample."""
@@ -137,6 +167,7 @@ class InferenceWorker:
         temperature: float = 0.7,
         agent_class: Any | None = None,
         agent_config: TechneConfig | None = None,
+        reward_fn_class: type | None = None,
     ):
         self.device = device
         self.num_generations = num_generations
@@ -160,10 +191,12 @@ class InferenceWorker:
         else:
             self.agent = None
 
+        # Instantiate reward function locally to avoid serialization issues
+        self.reward_fn = reward_fn_class() if reward_fn_class else None
+
     async def generate_and_score(
         self,
         samples_meta: list[dict],
-        reward_fn: Callable[[dict, str], float] | None = None,
     ) -> list[Sample]:
         """Generate completions and compute reference logprobs."""
         ret_samples = []
@@ -206,9 +239,9 @@ class InferenceWorker:
                     ref_logprobs = self.model.compute_logprobs(prompt_ids, completion_ids)
 
                     reward = 0.0
-                    if reward_fn:
+                    if self.reward_fn:
                         try:
-                            reward = reward_fn(sample, completion_text)
+                            reward = self.reward_fn(sample, completion_text)
                         except Exception:
                             reward = 0.0
 
@@ -241,9 +274,9 @@ class InferenceWorker:
                     ref_logprobs = self.model.compute_logprobs(prompt_ids, completion_ids)
 
                     reward = 0.0
-                    if reward_fn:
+                    if self.reward_fn:
                         try:
-                            reward = reward_fn(sample, completion)
+                            reward = self.reward_fn(sample, completion)
                         except Exception:
                             reward = 0.0
 
@@ -438,7 +471,6 @@ class DynamicBatcher:
         self,
         workers: list,
         dataset: Any,
-        reward_fn: Callable[[dict, str], float] | None,
         minibatch_size: int = 8,
         max_pending_per_worker: int = 2,
         num_prompts_per_dispatch: int = 1,
@@ -446,7 +478,6 @@ class DynamicBatcher:
     ):
         self.workers = workers
         self.dataset = dataset
-        self.reward_fn = reward_fn
         self.minibatch_size = minibatch_size
         self.max_pending_per_worker = max_pending_per_worker
         self.num_prompts_per_dispatch = num_prompts_per_dispatch
@@ -541,7 +572,7 @@ class DynamicBatcher:
     ) -> None:
         """Handle result from a single worker dispatch."""
         try:
-            future = worker.generate_and_score.remote(prompts, self.reward_fn)
+            future = worker.generate_and_score.remote(prompts)
             samples = await asyncio.wrap_future(future.future())
 
             # Stamp samples with the policy version they were generated under
@@ -843,7 +874,7 @@ async def train_async_rl(
     model: torch.nn.Module,
     tokenizer: AutoTokenizer,
     dataset: Any,
-    reward_fn: Callable[[dict, str], float] | None = None,
+    reward_fn_class: type | None = None,
     algorithm: str = "grpo",
     agent_class: Any | None = None,
     **kwargs,
@@ -866,7 +897,7 @@ async def train_async_rl(
         model: Model to train (used for single-GPU mode)
         tokenizer: Tokenizer
         dataset: HF dataset with "prompt" column
-        reward_fn: Reward function (prompt, completion) -> float
+        reward_fn_class: Reward function class (instantiated in workers)
         algorithm: "grpo", "ppo", "gspo", or "distill"
 
     Returns:
@@ -925,6 +956,7 @@ async def train_async_rl(
             temperature=config.rollout.temperature,
             agent_class=agent_class,
             agent_config=config,
+            reward_fn_class=reward_fn_class,
         )
         for _ in range(num_inference_workers)
     ]
@@ -973,7 +1005,6 @@ async def train_async_rl(
     dynamic_batcher = DynamicBatcher(
         workers=inference_workers,
         dataset=dataset,
-        reward_fn=reward_fn,
         minibatch_size=minibatch_size,
         max_pending_per_worker=2,
         num_prompts_per_dispatch=num_prompts_per_dispatch,
@@ -1073,7 +1104,8 @@ async def train_async_rl(
                             training_workers[0].get_state_dict.remote().future()
                         )
                     else:
-                        state_dict = {k: v.cpu() for k, v in model.state_dict().items()}
+                        # Use helper to merge LoRA weights if present
+                        state_dict = get_merged_state_dict(model)
                     for worker in inference_workers:
                         worker.update_weights.remote(state_dict)
                     # Increment policy version after weight sync

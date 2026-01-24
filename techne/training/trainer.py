@@ -6,6 +6,7 @@ Training types:
 - DISTILL_OFFLINE: Offline distillation
 """
 
+import logging
 from typing import Any
 
 from peft import LoraConfig, get_peft_model
@@ -14,6 +15,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from techne.config import TechneConfig, TrainingAlgorithm
 from techne.data import TrainingSample, Trajectory
 from techne.transform import FullHistoryTransform, TrajectoryTransform
+
+logger = logging.getLogger(__name__)
 
 
 class TechneTrainer:
@@ -56,7 +59,7 @@ class TechneTrainer:
         self,
         data: list[Trajectory] | list[TrainingSample] | Any | None = None,
         dataset: Any | None = None,
-        reward_fn: Any | None = None,
+        reward_fn_class: type | None = None,
         **kwargs,
     ):
         """Unified training entry point.
@@ -75,7 +78,7 @@ class TechneTrainer:
             from techne.training.rl import train_rl
 
             return await train_rl(
-                self.config, self.model, self.tokenizer, dataset, reward_fn, **kwargs
+                self.config, self.model, self.tokenizer, dataset, reward_fn_class, **kwargs
             )
 
         # 2. Offline Distillation
@@ -88,13 +91,15 @@ class TechneTrainer:
 
         # 3. Offline Training (SFT/DFT)
         if not data:
-            print("No data provided for training.")
+            logger.warning("No data provided for training.")
             return
 
         # Process trajectories if needed
         samples = data
-        if isinstance(data, list) and len(data) > 0 and isinstance(data[0], Trajectory):
-            samples = self.transform.process(data, self.tokenizer)
+        # We now prefer to let get_sft_trainer handle Trajectories directly to support
+        # correct multi-turn masking (which FullHistoryTransform doesn't fully support yet).
+        # if isinstance(data, list) and len(data) > 0 and isinstance(data[0], Trajectory):
+        #     samples = self.transform.process(data, self.tokenizer)
 
         from techne.training.sft import get_sft_trainer
 

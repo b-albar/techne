@@ -6,6 +6,7 @@ This module provides:
 - KL reward computation for on-policy distillation
 """
 
+import logging
 from typing import Any
 
 import torch
@@ -14,14 +15,17 @@ from transformers import PreTrainedModel, PreTrainedTokenizer
 from trl import SFTConfig, SFTTrainer
 
 from techne.config import DistillationMode, TechneConfig
+from techne.data import Trajectory
 from techne.training.alignment import DirectAligner, GoldAligner
 from techne.training.estimators import (
     ForwardKLEstimator,
     SlimEstimator,
     SparseLogits,
 )
-from techne.training.sft import get_common_training_args, get_sft_trainer
 from techne.training.model import create_teacher_model
+from techne.training.sft import get_common_training_args
+
+logger = logging.getLogger(__name__)
 
 # =============================================================================
 # Tokenizer Alignment Utilities
@@ -74,44 +78,79 @@ def train_distill_offline(
     """
     teacher_model_path = config.training.teacher_model
 
-    # If no teacher model specified, fall back to simple SFT on teacher data
-    if not teacher_model_path:
-        print("No teacher model specified. Using SFT-style distillation on teacher outputs...")
-        trainer = get_sft_trainer(config, model, tokenizer, dataset, **kwargs)
-        return trainer.train()
-
     # Data Validation
     assert len(dataset) > 0, "Distillation dataset is empty!"
 
-    # Check structure of first sample
-    sample = dataset[0]
-    has_input = "input_ids" in sample or "prompt" in sample
-    assert has_input, (
-        f"Dataset must contain 'input_ids' or 'prompt' column. Found: {list(sample.keys())}"
-    )
+    # 1. Normalize to List[Trajectory]
+    # We strictly expect serialized trajectories (dicts, json strings) or Trajectory objects
+    trajectories = []
+    logger.info("Normalizing dataset to Trajectories...")
+    for item in dataset:
+        if isinstance(item, Trajectory):
+            trajectories.append(item)
+        elif isinstance(item, dict):
+            # Expect serialized Trajectory
+            try:
+                trajectories.append(Trajectory.model_validate(item))
+            except Exception as e:
+                logger.warning("Failed to validate dict as Trajectory: %s", e)
+        elif isinstance(item, str):
+            # Expect JSON string
+            try:
+                trajectories.append(Trajectory.model_validate_json(item))
+            except Exception as e:
+                logger.warning("Failed to parse JSON string as Trajectory: %s", e)
+        else:
+            logger.warning("Skipping unsupported item type: %s", type(item))
 
-    if "input_ids" in sample:
-        ids = sample["input_ids"]
-        assert len(ids) > 0, "Found sample with empty 'input_ids'!"
-        if isinstance(ids, torch.Tensor):
-            assert ids.numel() > 0, "Found sample with empty 'input_ids' tensor!"
+    if len(trajectories) == 0:
+        raise ValueError("No valid Trajectories found in dataset!")
 
-    # Load teacher model and tokenizer
-    print(f"Loading teacher model for logit distillation: {teacher_model_path}...")
-    teacher_model = create_teacher_model(
-        teacher_model_path,
-        device="auto",
-        dtype=config.model.dtype,
-    )
-    teacher_tokenizer = teacher_model.tokenizer
 
-    # Check if tokenizers are identical
-    same_tokenizer = are_tokenizers_identical(tokenizer, teacher_tokenizer)
+    # 2. Prepare for Distillation (KL Loss)
+    logger.info("Preparing distillation dataset from Trajectories...")
+    processed_samples = []
+    samples_with_logprobs = 0
 
-    if same_tokenizer:
-        print("Tokenizers are identical - using direct logit alignment")
+    for traj in trajectories:
+        sample = traj.to_training_sample(tokenizer=tokenizer)
+        sample_dict = {"input_ids": sample.input_ids, "labels": sample.labels}
+
+        if sample.log_probs is not None:
+            sample_dict["teacher_logprobs"] = sample.log_probs
+            samples_with_logprobs += 1
+
+        processed_samples.append(sample_dict)
+
+    dataset = processed_samples
+    all_have_logprobs = samples_with_logprobs == len(processed_samples)
+
+    # Load teacher model only if needed (not all samples have cached logprobs)
+    teacher_model = None
+    teacher_tokenizer = None
+    same_tokenizer = True
+
+    if all_have_logprobs:
+        logger.info("All %d samples have cached teacher logprobs - skipping teacher model load", len(dataset))
     else:
-        print("Different tokenizers detected - using GOLD approach (decode & re-tokenize)")
+        if not teacher_model_path:
+            raise ValueError(
+                "Distillation requires either cached logprobs in trajectories "
+                "or a teacher model path in config."
+            )
+        logger.info("Loading teacher model for logit distillation: %s", teacher_model_path)
+        teacher_model = create_teacher_model(
+            teacher_model_path,
+            device="auto",
+            dtype=config.model.dtype,
+        )
+        teacher_tokenizer = teacher_model.tokenizer
+        same_tokenizer = are_tokenizers_identical(tokenizer, teacher_tokenizer)
+
+        if same_tokenizer:
+            logger.info("Tokenizers are identical - using direct logit alignment")
+        else:
+            logger.info("Different tokenizers detected - using GOLD approach (decode & re-tokenize)")
 
     # Create trainer config
     args_dict = get_common_training_args(config)
@@ -135,7 +174,7 @@ def train_distill_offline(
         processing_class=tokenizer,
     )
 
-    print(f"Starting offline distillation with KL loss on {len(dataset)} samples...")
+    logger.info("Starting offline distillation with KL loss on %d samples", len(dataset))
     return trainer.train()
 
 
@@ -220,10 +259,13 @@ class _DistillationTrainer(SFTTrainer):
         self.distillation_mode = distillation_mode
         self.slim_top_k = slim_top_k
 
-        if same_tokenizer:
-            self.aligner = DirectAligner(student_tokenizer, teacher_tokenizer)
-        else:
-            self.aligner = GoldAligner(student_tokenizer, teacher_tokenizer)
+        # Aligner only needed if we have a teacher model
+        self.aligner = None
+        if teacher is not None:
+            if same_tokenizer:
+                self.aligner = DirectAligner(student_tokenizer, teacher_tokenizer)
+            else:
+                self.aligner = GoldAligner(student_tokenizer, teacher_tokenizer)
 
         # Initialize Estimator
         if distillation_mode == DistillationMode.SLIM:
@@ -239,64 +281,118 @@ class _DistillationTrainer(SFTTrainer):
         kl_loss = torch.tensor(0.0, device=student_logits.device)
 
         if self.kl_weight > 0:
-            with torch.no_grad():
-                # Prepare teacher inputs
-                if isinstance(self.aligner, DirectAligner):
-                    # Move inputs to teacher device
-                    teacher_inputs = {
-                        k: v.to(self.teacher.device) if isinstance(v, torch.Tensor) else v
-                        for k, v in inputs.items()
-                    }
-                    teacher_outputs = self.teacher(**teacher_inputs)
-
-                    # Direct Alignment Logic: Length Truncation
-                    min_len = min(student_logits.shape[1], teacher_outputs.logits.shape[1])
-                    s_logits = student_logits[:, :min_len, :]
-                    t_logits = teacher_outputs.logits[:, :min_len, :]
-
-                    # Prepare Teacher Data (Sparse or Dense)
-                    if self.distillation_mode == DistillationMode.SLIM:
-                        k = self.slim_top_k or 100
-                        vals, idxs = t_logits.topk(k, dim=-1)
-                        teacher_data = SparseLogits(indices=idxs, values=vals)
-                    else:
-                        teacher_data = t_logits
-
-                    # Compute Loss using Estimator
-                    # Handle potential None pad_token_id
-                    pad_id = self.student_tokenizer.pad_token_id
-                    if pad_id is not None:
-                        mask = (inputs["input_ids"][:, :min_len] != pad_id).float()
-                    else:
-                        mask = torch.ones(
-                            inputs["input_ids"][:, :min_len].shape, device=s_logits.device
-                        )
-                    kl_loss = self.estimator.compute_loss(s_logits, teacher_data, mask=mask)
-
-                else:
-                    # GoldAligner case (Different Tokenizers)
-                    # Re-tokenize
-                    texts = self.student_tokenizer.batch_decode(
-                        inputs["input_ids"], skip_special_tokens=False
-                    )
-                    teacher_inputs = self.teacher_tokenizer(
-                        texts,
-                        return_tensors="pt",
-                        padding=True,
-                        truncation=True,
-                        max_length=inputs["input_ids"].shape[1] * 2,
-                    ).to(self.teacher.device)
-
-                    teacher_outputs = self.teacher(**teacher_inputs)
-
-                    # Compute Aligned KL (GoldAligner encapsulates ULD logic)
-                    kl_loss = self.aligner.compute_kl_loss(
-                        student_logits,
-                        teacher_outputs.logits,
-                        inputs["input_ids"],
-                        teacher_inputs["input_ids"],
-                        temperature=2.0,
-                    )
+            # Check if we have cached teacher logprobs
+            if "teacher_logprobs" in inputs:
+                kl_loss = self._compute_kl_from_cached_logprobs(
+                    student_logits, inputs["teacher_logprobs"], inputs
+                )
+            elif self.teacher is not None:
+                kl_loss = self._compute_kl_from_teacher(student_logits, inputs)
 
         loss = (1 - self.kl_weight) * student_loss + self.kl_weight * kl_loss
         return (loss, outputs) if return_outputs else loss
+
+    def _compute_kl_from_cached_logprobs(
+        self,
+        student_logits: torch.Tensor,
+        teacher_logprobs: torch.Tensor,
+        inputs: dict,
+    ) -> torch.Tensor:
+        """Compute KL loss using pre-computed teacher logprobs."""
+        # teacher_logprobs shape: (batch, seq_len) - just the logprob of chosen tokens
+        # We compute KL as: -sum(teacher_logprob) + sum(student_logprob_of_same_token)
+        # This is equivalent to minimizing cross-entropy with teacher's distribution
+
+        student_logprobs = F.log_softmax(student_logits, dim=-1)
+        seq_len = min(student_logprobs.shape[1], teacher_logprobs.shape[1])
+
+        # Get student logprobs for the actual tokens
+        input_ids = inputs["input_ids"][:, :seq_len]
+        student_token_logprobs = student_logprobs[:, :seq_len, :].gather(
+            2, input_ids.unsqueeze(-1)
+        ).squeeze(-1)
+
+        # KL divergence: teacher_logprob - student_logprob (we want student to match teacher)
+        # Since we want to minimize, loss = teacher_logprob - student_logprob
+        teacher_lp = teacher_logprobs[:, :seq_len]
+        kl_per_token = teacher_lp - student_token_logprobs
+
+        # Build mask
+        mask = torch.ones_like(kl_per_token)
+        pad_id = self.student_tokenizer.pad_token_id
+        if pad_id is not None:
+            mask = mask * (input_ids != pad_id).float()
+        if "labels" in inputs:
+            labels = inputs["labels"][:, :seq_len]
+            mask = mask * (labels != -100).float()
+
+        # Masked mean
+        kl_loss = (kl_per_token * mask).sum() / mask.sum().clamp(min=1)
+        return kl_loss
+
+    def _compute_kl_from_teacher(
+        self,
+        student_logits: torch.Tensor,
+        inputs: dict,
+    ) -> torch.Tensor:
+        """Compute KL loss by running teacher forward pass."""
+        with torch.no_grad():
+            if isinstance(self.aligner, DirectAligner):
+                # Move inputs to teacher device
+                teacher_inputs = {
+                    k: v.to(self.teacher.device) if isinstance(v, torch.Tensor) else v
+                    for k, v in inputs.items()
+                }
+                teacher_outputs = self.teacher(**teacher_inputs)
+
+                # Direct Alignment Logic: Length Truncation
+                min_len = min(student_logits.shape[1], teacher_outputs.logits.shape[1])
+                s_logits = student_logits[:, :min_len, :]
+                t_logits = teacher_outputs.logits[:, :min_len, :]
+
+                # Prepare Teacher Data (Sparse or Dense)
+                if self.distillation_mode == DistillationMode.SLIM:
+                    k = self.slim_top_k or 100
+                    vals, idxs = t_logits.topk(k, dim=-1)
+                    teacher_data = SparseLogits(indices=idxs, values=vals)
+                else:
+                    teacher_data = t_logits
+
+                # Build mask
+                pad_id = self.student_tokenizer.pad_token_id
+                if pad_id is not None:
+                    mask = (inputs["input_ids"][:, :min_len] != pad_id).float()
+                else:
+                    mask = torch.ones(
+                        inputs["input_ids"][:, :min_len].shape, device=s_logits.device
+                    )
+
+                if "labels" in inputs:
+                    labels = inputs["labels"][:, :min_len]
+                    valid_label_mask = (labels != -100).float()
+                    mask = mask * valid_label_mask
+
+                return self.estimator.compute_loss(s_logits, teacher_data, mask=mask)
+
+            else:
+                # GoldAligner case (Different Tokenizers)
+                texts = self.student_tokenizer.batch_decode(
+                    inputs["input_ids"], skip_special_tokens=False
+                )
+                teacher_inputs = self.teacher_tokenizer(
+                    texts,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=inputs["input_ids"].shape[1] * 2,
+                ).to(self.teacher.device)
+
+                teacher_outputs = self.teacher(**teacher_inputs)
+
+                return self.aligner.compute_kl_loss(
+                    student_logits,
+                    teacher_outputs.logits,
+                    inputs["input_ids"],
+                    teacher_inputs["input_ids"],
+                    temperature=2.0,
+                )
