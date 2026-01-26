@@ -5,7 +5,6 @@ model:
   dtype: "bfloat16"
   attn_implementation: "sdpa"
   trust_remote_code: true
-  compile: true
   lora:
     enabled: true
     r: 16
@@ -21,15 +20,15 @@ training:
   batch_size: 1
   gradient_accumulation_steps: 1
   num_train_epochs: 1
-  max_seq_length: 1024
   sync_weights: true
   report_to: "none"
   clip_range_ratio: [0.8, 1.28]
+  num_generations: 2
 
   inference:
     name_or_path: "Qwen/Qwen3-0.6B"
     temperature: 0.6
-    max_new_tokens: 2048
+    max_new_tokens: 512
     top_k: 50
     top_p: 0.95
 

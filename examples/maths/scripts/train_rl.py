@@ -9,6 +9,26 @@ from techne.config import TechneConfig
 from techne.training.trainer import TechneTrainer
 
 
+class MathRewardFn:
+    """Reward function that checks if the predicted answer matches ground truth.
+
+    Must be defined at module level for Ray serialization to work properly.
+    """
+
+    def __call__(self, sample: dict, completion: str) -> float:
+        gt = sample.get("ground_truth")
+        if gt is None:
+            # Fallback if nested in reward_model
+            if "reward_model" in sample and isinstance(sample["reward_model"], dict):
+                gt = sample["reward_model"].get("ground_truth")
+
+        if gt is None:
+            return 0.0
+
+        predicted = MathReward.extract_answer(completion)
+        return 1.0 if MathReward.is_correct(predicted, gt) else 0.0
+
+
 async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="examples/maths/configs/agent_training.yaml")
@@ -39,27 +59,11 @@ async def main():
         print("Preprocessing dataset to extract ground truths...")
         train_ds = train_ds.map(lambda x: {"ground_truth": x["reward_model"]["ground_truth"]})
 
-    # 4. Prepare Reward Function
-    # The new async RL passes (prompt, completion) to the reward function.
-    # We use a lookup table to find the ground truth for each prompt.
-    def reward_fn_wrapper(sample: dict, completion: str) -> float:
-        gt = sample.get("ground_truth")
-        if gt is None:
-            # Fallback if nested in reward_model (should be handled by preprocessing but just in case)
-            if "reward_model" in sample and isinstance(sample["reward_model"], dict):
-                gt = sample["reward_model"].get("ground_truth")
-
-        if gt is None:
-            return 0.0
-
-        predicted = MathReward.extract_answer(completion)
-        return 1.0 if MathReward.is_correct(predicted, gt) else 0.0
-
-    # 5. Start Async Training
+    # 4. Start Async Training
     # We pass the class MathToolAgent because workers will instantiate it themselves.
     await trainer.train(
         dataset=train_ds,
-        reward_fn=reward_fn_wrapper,
+        reward_fn_class=MathRewardFn,  # Pass the class, not an instance
         agent_class=MathToolAgent,
     )
 

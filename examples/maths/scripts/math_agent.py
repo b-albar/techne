@@ -115,11 +115,6 @@ class MathToolAgent(Agent):
 
         self.device = self.model.device
 
-        # Optionally compile the model
-        if self.config.model.compile and hasattr(torch, "compile"):
-            if hasattr(self.model, "_model"):
-                self.model._model.forward = torch.compile(self.model._model.forward)
-
         # Cache special tokens for message construction
         self._cache_special_tokens()
 

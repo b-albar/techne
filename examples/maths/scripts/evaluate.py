@@ -80,7 +80,6 @@ async def run_distributed_evaluation(args):
         else TechneConfig(model={"name_or_path": args.model})
     )
     config.model.name_or_path = args.model
-    config.model.compile = args.torch_compile
     # Force eager attention for evaluation if not specified
     if not hasattr(config.model, "attn_implementation"):
         config.model.attn_implementation = "eager"
@@ -178,7 +177,6 @@ def main():
         "--max-samples", type=int, default=-1, help="Max samples to evaluate (-1 for all)"
     )
     parser.add_argument("--parallel", type=int, default=2, help="Number of parallel workers")
-    parser.add_argument("--torch-compile", action="store_true", help="Enable torch.compile")
     args = parser.parse_args()
 
     asyncio.run(run_distributed_evaluation(args))

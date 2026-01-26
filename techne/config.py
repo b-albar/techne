@@ -178,7 +178,7 @@ class ModelConfig(BaseModel):
     """Configuration for the main model being trained.
 
     Separate from InferenceConfig because training has additional options
-    like LoRA and torch.compile that don't apply to inference workers.
+    like LoRA that don't apply to inference workers.
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -187,7 +187,6 @@ class ModelConfig(BaseModel):
     dtype: Any = torch.bfloat16
     attn_implementation: str = "flash_attention_2"
     trust_remote_code: bool = True
-    compile: bool = False
     lora: LoRAConfig = Field(default_factory=LoRAConfig)
 
     @field_validator("dtype", mode="before")

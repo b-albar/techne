@@ -5,7 +5,6 @@ model:
   dtype: "bfloat16"
   attn_implementation: "sdpa"
   trust_remote_code: true
-  compile: true
   lora:
     enabled: true
     r: 16

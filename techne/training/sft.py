@@ -95,7 +95,6 @@ def get_common_training_args(config: TechneConfig) -> dict:
         "save_steps": config.save_steps,
         "save_strategy": "steps",
         "remove_unused_columns": False,
-        "torch_compile": config.model.compile,
         "disable_tqdm": False,
         "log_level": "info",
     }

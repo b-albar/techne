@@ -190,11 +190,31 @@ class InferenceWorker:
         # Instantiate reward function locally to avoid serialization issues
         self.reward_fn = reward_fn_class() if reward_fn_class else None
 
+        # Metrics tracking
+        self._metrics = {
+            "prompts_processed": 0,
+            "trajectories_collected": 0,
+            "total_reward": 0.0,
+            "positive_rewards": 0,
+            "generation_time": 0.0,
+        }
+        self._start_time = time.time()
+
+    def get_metrics(self) -> dict:
+        """Return current worker metrics."""
+        elapsed = time.time() - self._start_time
+        return {
+            **self._metrics,
+            "elapsed_time": elapsed,
+            "prompts_per_sec": self._metrics["prompts_processed"] / elapsed if elapsed > 0 else 0,
+        }
+
     async def generate_and_score(
         self,
         samples_meta: list[dict],
     ) -> list[Sample]:
         """Generate completions and compute reference logprobs."""
+        gen_start = time.time()
         ret_samples = []
 
         for sample in samples_meta:
@@ -286,6 +306,13 @@ class InferenceWorker:
                             reward=reward,
                         )
                     )
+
+        # Update metrics
+        self._metrics["prompts_processed"] += len(samples_meta)
+        self._metrics["trajectories_collected"] += len(ret_samples)
+        self._metrics["total_reward"] += sum(s.reward for s in ret_samples)
+        self._metrics["positive_rewards"] += sum(1 for s in ret_samples if s.reward > 0)
+        self._metrics["generation_time"] += time.time() - gen_start
 
         return ret_samples
 
@@ -627,6 +654,11 @@ class DynamicBatcher:
             # Skip zero-gradient batches (Open-Instruct active sampling filter)
             if skip_zero_gradient and should_skip_batch(batch):
                 self.stats["batches_skipped_zero_grad"] += 1
+                rewards = [s.reward for s in batch]
+                logger.debug(
+                    f"Skipping zero-gradient batch: rewards={rewards}, "
+                    f"total_skipped={self.stats['batches_skipped_zero_grad']}"
+                )
                 continue
 
             return batch
@@ -656,7 +688,41 @@ class DynamicBatcher:
             and self.cache.pending_count() < self.minibatch_size
         )
 
-    def get_inference_metrics(self) -> dict[str, float]:
+    async def fetch_worker_metrics(self) -> dict[str, Any]:
+        """Fetch and aggregate metrics from all workers."""
+        try:
+            futures = [w.get_metrics.remote() for w in self.workers]
+            metrics_list = await asyncio.gather(
+                *[asyncio.wrap_future(f.future()) for f in futures],
+                return_exceptions=True,
+            )
+
+            # Aggregate metrics
+            total_prompts = 0
+            total_trajectories = 0
+            total_reward = 0.0
+            positive_rewards = 0
+            total_gen_time = 0.0
+
+            for m in metrics_list:
+                if isinstance(m, dict):
+                    total_prompts += m.get("prompts_processed", 0)
+                    total_trajectories += m.get("trajectories_collected", 0)
+                    total_reward += m.get("total_reward", 0.0)
+                    positive_rewards += m.get("positive_rewards", 0)
+                    total_gen_time += m.get("generation_time", 0.0)
+
+            return {
+                "prompts": total_prompts,
+                "trajs": total_trajectories,
+                "reward": total_reward,
+                "pos_rewards": positive_rewards,
+                "gen_time": total_gen_time,
+            }
+        except Exception:
+            return {}
+
+    def get_inference_metrics(self, worker_metrics: dict | None = None) -> dict[str, float]:
         """Get current inference metrics for progress display."""
         elapsed = time.time() - self._start_time
         samples_generated = self.stats["samples_generated"]
@@ -677,7 +743,7 @@ class DynamicBatcher:
         # Active workers (those with pending tasks)
         active_workers = sum(1 for p in self._worker_pending.values() if p > 0)
 
-        return {
+        metrics = {
             "gen/s": round(samples_per_sec, 1),
             "resp_len": round(avg_resp_len, 0),
             "pending": pending,
@@ -685,6 +751,15 @@ class DynamicBatcher:
             "stale": self.stats["samples_dropped_stale"],
             "skipped": self.stats["batches_skipped_zero_grad"],
         }
+
+        # Add worker metrics if provided
+        if worker_metrics:
+            trajs = worker_metrics.get("trajs", 0)
+            pos = worker_metrics.get("pos_rewards", 0)
+            metrics["trajs"] = trajs
+            metrics["reward%"] = round(100 * pos / trajs, 1) if trajs > 0 else 0.0
+
+        return metrics
 
 
 def compute_rl_loss(
@@ -1016,6 +1091,8 @@ async def train_async_rl(
                 if dynamic_batcher.is_exhausted:
                     logger.info("Dataset exhausted, stopping training")
                     break
+                # Update progress bar while waiting (shows skipped batches, generation progress)
+                pbar.set_postfix(dynamic_batcher.get_inference_metrics())
                 continue
 
             # Collect samples into PPO buffer
@@ -1023,6 +1100,8 @@ async def train_async_rl(
 
             # Wait until we have enough samples for a full PPO batch
             if len(ppo_buffer) < ppo_batch_size:
+                # Update progress bar while collecting samples
+                pbar.set_postfix(dynamic_batcher.get_inference_metrics())
                 continue
 
             # Extract ppo_batch_size samples for training
@@ -1113,7 +1192,12 @@ async def train_async_rl(
                         grad_accum_count = 0
 
                         # Update progress bar with combined training + inference metrics
-                        inference_metrics = dynamic_batcher.get_inference_metrics()
+                        # Fetch worker metrics periodically (every logging_steps)
+                        worker_metrics = None
+                        if global_step % config.logging_steps == 0:
+                            worker_metrics = await dynamic_batcher.fetch_worker_metrics()
+
+                        inference_metrics = dynamic_batcher.get_inference_metrics(worker_metrics)
                         if global_step % config.logging_steps == 0:
                             avg_metrics = {
                                 k: v / config.logging_steps for k, v in total_metrics.items()
