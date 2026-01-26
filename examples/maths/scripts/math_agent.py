@@ -9,13 +9,16 @@ import os
 import re
 import signal
 import traceback
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
 from techne.agent import Agent
 from techne.config import TechneConfig
 from techne.data import Step, Trajectory
+
+if TYPE_CHECKING:
+    from techne.training.model import InferenceModel
 
 
 class CodeSandbox:
@@ -66,14 +69,15 @@ class MathToolAgent(Agent):
         "Solve the following problem:\n"
     )
 
-    def __init__(self, config: TechneConfig, model: Any = None, tokenizer: Any = None):
+    def __init__(
+        self,
+        config: TechneConfig,
+        model: InferenceModel | None = None,
+        tokenizer: Any = None,
+    ):
         self.config = config
-        self.model_name = config.model.name_or_path
-        self.max_turns = config.rollout.max_turns
-
-        # Model/tokenizer (shared for on-policy training)
-        self.model = model
-        self.tokenizer = tokenizer
+        self.max_turns = config.max_turns
+        self.inference_config = config.get_inference_config()
 
         # Tool tags
         self.tool_start = config.tags.get("tool_start", "```python")
@@ -81,62 +85,61 @@ class MathToolAgent(Agent):
         self.resp_start = config.tags.get("resp_start", "```output")
         self.resp_end = config.tags.get("resp_end", "```")
 
-        # Backend setup
-        self._setup_backend()
+        # Model setup
+        self._setup_model(model, tokenizer)
 
         # Async lock for generation serialization
         self.lock = asyncio.Lock()
 
-    def _setup_backend(self):
-        """Initialize model backend (HuggingFace or OpenAI)."""
-        is_hf = (
-            os.path.exists(self.model_name)
-            or self.model is not None
-            or "/" in self.model_name
-            or self.model_name.startswith(("qwen", "llama"))
-        )
-
-        if is_hf:
-            self.backend = "huggingface"
-            self.device = "cuda" if torch.cuda.is_available() else "cpu"
-            self._setup_hf_model()
-        else:
+    def _setup_model(self, model: InferenceModel | None, tokenizer: Any):
+        """Initialize model from config or use provided model."""
+        # Check for OpenAI backend first
+        if self._is_openai_model():
             self.backend = "openai"
+            self.model = None
+            self.tokenizer = None
             self._setup_openai_client()
+            return
 
-    def _setup_hf_model(self):
-        """Load HuggingFace model and tokenizer."""
-        if not self.tokenizer:
-            from transformers import AutoTokenizer
+        self.backend = "huggingface"
 
-            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        if model is not None:
+            # Use provided model (for on-policy training)
+            self.model = model
+            self.tokenizer = tokenizer or model.get_tokenizer()
+        else:
+            # Create model from config
+            inference_config = self.config.get_inference_config()
+            self.model = inference_config.create_inference_model()
+            self.tokenizer = self.model.get_tokenizer()
 
-        if not self.model:
-            from transformers import AutoModelForCausalLM
+        self.device = self.model.device
 
-            dtype = self._get_torch_dtype()
-            self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_name, device_map="auto", dtype=dtype
-            )
-
+        # Optionally compile the model
         if self.config.model.compile and hasattr(torch, "compile"):
-            self.model.forward = torch.compile(self.model.forward)
+            if hasattr(self.model, "_model"):
+                self.model._model.forward = torch.compile(self.model._model.forward)
 
         # Cache special tokens for message construction
+        self._cache_special_tokens()
+
+    def _is_openai_model(self) -> bool:
+        """Check if model name indicates an OpenAI model."""
+        model_name = self.config.model.name_or_path
+        # OpenAI models don't have "/" and aren't local paths
+        return (
+            not os.path.exists(model_name)
+            and "/" not in model_name
+            and not model_name.startswith(("qwen", "llama", "mistral", "phi"))
+        )
+
+    def _cache_special_tokens(self):
+        """Cache special tokens for efficient message construction."""
         self._im_start_id = self.tokenizer.convert_tokens_to_ids("<|im_start|>")
         self._im_end_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
         self._nl_tokens = self.tokenizer.encode("\n", add_special_tokens=False)
         # Closing tokens for assistant messages: <|im_end|>\n
         self._msg_close_tokens = [self._im_end_id] + self._nl_tokens
-
-    def _get_torch_dtype(self) -> torch.dtype:
-        """Get torch dtype from config."""
-        model_dtype = getattr(self.config.model, "dtype", "bfloat16")
-        if isinstance(model_dtype, torch.dtype):
-            return model_dtype
-        if isinstance(model_dtype, str) and hasattr(torch, model_dtype):
-            return getattr(torch, model_dtype)
-        return torch.bfloat16
 
     def _setup_openai_client(self):
         """Initialize OpenAI client."""
@@ -171,6 +174,33 @@ class MathToolAgent(Agent):
             + self._nl_tokens
         )
 
+    def tokenize_messages(self, messages: list[dict]) -> dict[str, list[int]]:
+        """Tokenize a conversation for training.
+
+        Args:
+            messages: List of message dicts with 'role' and 'content' keys.
+
+        Returns:
+            Dict with 'input_ids' and 'labels' where non-assistant tokens are masked.
+        """
+        input_ids = []
+        labels = []
+
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            tokens = self._tokenize_message(role, content)
+
+            input_ids.extend(tokens)
+
+            # Only train on assistant responses
+            if role == "assistant":
+                labels.extend(tokens)
+            else:
+                labels.extend([-100] * len(tokens))
+
+        return {"input_ids": input_ids, "labels": labels}
+
     async def collect_trajectories(
         self, prompts: list[str], use_kv_cache: bool = True
     ) -> list[Trajectory]:
@@ -184,11 +214,8 @@ class MathToolAgent(Agent):
         messages: list[dict] = []
         accumulated_tokens: list[int] = []
 
-        # KV cache state (only for HuggingFace backend)
-        past_key_values = None
-        cache_len = 0  # Track number of tokens in cache
-        pending_tokens: list[int] = []  # Tokens to process in next generate call
         use_cache = use_kv_cache and self.backend == "huggingface"
+        is_first_turn = True
 
         def add_turn(
             role: str,
@@ -238,16 +265,17 @@ class MathToolAgent(Agent):
 
         for turn in range(self.max_turns):
             if use_cache:
-                # KV cache path: accumulate tokens and pass to generate
-                if past_key_values is None:
+                # Use model's KV cache for efficient multi-turn generation
+                if is_first_turn:
                     input_ids = accumulated_tokens + gen_prompt_tokens
                 else:
-                    input_ids = pending_tokens + gen_prompt_tokens
+                    input_ids = gen_prompt_tokens
 
-                text, meta, past_key_values, cache_len = await self._generate_with_cache(
-                    input_ids, past_key_values, cache_len
+                text, token_ids, log_probs = await self._generate_cached(
+                    input_ids, continue_from_cache=not is_first_turn
                 )
-                pending_tokens = []
+                is_first_turn = False
+                meta = {"logprobs": log_probs, "token_ids": token_ids}
             else:
                 # No cache: decode full context each time
                 context = self.tokenizer.decode(
@@ -264,11 +292,11 @@ class MathToolAgent(Agent):
                 token_ids=meta.get("token_ids"),
             )
 
-            # Queue closing tokens for next generation if model didn't generate them
+            # Add closing tokens to cache if model didn't generate them
             if use_cache:
                 gen_token_ids = meta.get("token_ids", [])
                 if not gen_token_ids or gen_token_ids[-1] != self._im_end_id:
-                    pending_tokens.extend(self._msg_close_tokens)
+                    self.model.prefill_cache(self._msg_close_tokens)
 
             # Check for tool use
             code = self._extract_code(text)
@@ -281,7 +309,7 @@ class MathToolAgent(Agent):
                 trajectory.steps[-1].role = "tool"
 
                 if use_cache:
-                    pending_tokens.extend(user_tokens)
+                    self.model.prefill_cache(user_tokens)
 
             elif "<answer>" in text or "</answer>" in text:
                 break
@@ -294,18 +322,31 @@ class MathToolAgent(Agent):
                 user_tokens = add_turn("user", msg)
 
                 if use_cache:
-                    pending_tokens.extend(user_tokens)
+                    self.model.prefill_cache(user_tokens)
+
+        # Clear cache at end of rollout
+        if use_cache:
+            self.model.clear_kv_cache()
 
         return trajectory
 
-    async def _generate_with_cache(
-        self, input_ids: list[int], past_key_values: Any | None, cache_len: int
-    ) -> tuple[str, dict, Any, int]:
-        """Generate with KV cache (HuggingFace only)."""
+    async def _generate_cached(
+        self, input_ids: list[int], continue_from_cache: bool = False
+    ) -> tuple[str, list[int], list[float]]:
+        """Generate using model's KV cache."""
         async with self.lock:
-            return await asyncio.to_thread(
-                self._generate_hf_with_cache, input_ids, past_key_values, cache_len
+            generated_ids, log_probs = await asyncio.to_thread(
+                self.model.generate_with_cache,
+                input_ids,
+                max_new_tokens=self.inference_config.max_new_tokens,
+                temperature=self.inference_config.temperature,
+                top_p=self.inference_config.top_p,
+                top_k=self.inference_config.top_k,
+                continue_from_cache=continue_from_cache,
+                keep_cache=True,
             )
+        text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+        return text, generated_ids, log_probs
 
     def _add_initial_messages(self, prompt, add_turn) -> bool:
         """Add initial messages from prompt. Returns True if system message exists."""
@@ -344,7 +385,7 @@ class MathToolAgent(Agent):
 
     async def _generate_openai(self, context: str) -> tuple[str, dict]:
         response = await self.client.chat.completions.create(
-            model=self.model_name,
+            model=self.config.model.name_or_path,
             messages=[{"role": "user", "content": context}],
             stop=[self.tool_end],
             logprobs=True,
@@ -356,17 +397,18 @@ class MathToolAgent(Agent):
         return text, {"logprobs": logprobs, "token_ids": []}
 
     def _generate_hf(self, context: str) -> tuple[str, dict]:
+        """Generate using HuggingFace model."""
         inputs = self.tokenizer(context, return_tensors="pt").to(self.device)
         input_len = inputs.input_ids.shape[1]
 
         with torch.no_grad():
             outputs = self.model.generate(
                 **inputs,
-                max_new_tokens=self.config.rollout.max_new_tokens,
+                max_new_tokens=self.inference_config.max_new_tokens,
                 do_sample=True,
-                temperature=self.config.rollout.temperature,
-                top_p=self.config.rollout.top_p,
-                top_k=self.config.rollout.top_k,
+                temperature=self.inference_config.temperature,
+                top_p=self.inference_config.top_p,
+                top_k=self.inference_config.top_k,
                 return_dict_in_generate=True,
                 output_scores=True,
                 pad_token_id=self.tokenizer.eos_token_id,
@@ -386,78 +428,10 @@ class MathToolAgent(Agent):
 
         return text, {"logprobs": logprobs, "token_ids": gen_tokens.tolist()}
 
-    def _generate_hf_with_cache(
-        self, input_ids: list[int], past_key_values: Any | None, cache_len: int
-    ) -> tuple[str, dict, Any, int]:
-        """Generate with KV cache support."""
-        from transformers import DynamicCache
-
-        input_tensor = torch.tensor([input_ids], device=self.device)
-        input_len = len(input_ids)
-
-        # Build generate kwargs
-        gen_kwargs = {
-            "input_ids": input_tensor,
-            "max_new_tokens": self.config.rollout.max_new_tokens,
-            "do_sample": True,
-            "temperature": self.config.rollout.temperature,
-            "top_p": self.config.rollout.top_p,
-            "top_k": self.config.rollout.top_k,
-            "return_dict_in_generate": True,
-            "output_scores": True,
-            "use_cache": True,
-            "pad_token_id": self.tokenizer.eos_token_id,
-        }
-
-        # Pass past_key_values, attention_mask, and cache_position if we have cache
-        if past_key_values is not None:
-            if isinstance(past_key_values, tuple):
-                cache = DynamicCache.from_legacy_cache(past_key_values)
-            else:
-                cache = past_key_values
-
-            actual_cache_len = cache.get_seq_length()
-            gen_kwargs["past_key_values"] = cache
-            gen_kwargs["attention_mask"] = torch.ones(
-                1, actual_cache_len + input_len, device=self.device, dtype=torch.long
-            )
-            gen_kwargs["cache_position"] = torch.arange(
-                actual_cache_len, actual_cache_len + input_len, device=self.device
-            )
-
-        with torch.no_grad():
-            outputs = self.model.generate(**gen_kwargs)
-
-        # Generated tokens start after input
-        gen_tokens = outputs.sequences[0, input_len:]
-        text = self.tokenizer.decode(gen_tokens, skip_special_tokens=True)
-
-        # Calculate logprobs from scores
-        logprobs = []
-        if outputs.scores:
-            token_ids = gen_tokens.tolist()
-            for i, scores in enumerate(outputs.scores):
-                if i < len(token_ids):
-                    log_probs = torch.log_softmax(scores, dim=-1)
-                    logprobs.append(log_probs[0, token_ids[i]].item())
-
-        # Get new cache length from cache itself
-        new_cache = outputs.past_key_values
-        new_cache_len = (
-            new_cache.get_seq_length()
-            if hasattr(new_cache, "get_seq_length")
-            else cache_len + input_len + len(gen_tokens)
-        )
-
-        return (
-            text,
-            {"logprobs": logprobs, "token_ids": gen_tokens.tolist()},
-            new_cache,
-            new_cache_len,
-        )
-
     async def update_model(self, state_dict: dict[str, Any]) -> None:
-        pass
+        """Update model weights (for on-policy training)."""
+        if hasattr(self.model, "load_state_dict"):
+            self.model.load_state_dict(state_dict)
 
 
 if __name__ == "__main__":
@@ -476,17 +450,25 @@ if __name__ == "__main__":
 
     prompt = args[0] if args else ""
 
+    # Create config with inference settings
     config = TechneConfig(
-        **{
-            "model": {"name_or_path": "Qwen/Qwen3-0.6B", "dtype": "bfloat16", "compile": False},
-            "rollout": {
-                "max_turns": 10,
+        model={
+            "name_or_path": "Qwen/Qwen3-0.6B",
+            "dtype": "bfloat16",
+            "compile": False,
+        },
+        training={
+            "inference": {
+                "name_or_path": "Qwen/Qwen3-0.6B",
+                "dtype": "bfloat16",
+                "device": "cuda",
                 "max_new_tokens": 1024,
                 "temperature": 0.6,
                 "top_p": 0.95,
                 "top_k": 50,
-            },
-        }
+            }
+        },
+        max_turns=10,
     )
 
     agent = MathToolAgent(config)

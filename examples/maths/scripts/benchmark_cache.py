@@ -12,16 +12,17 @@ PROMPT = "Find the sum of all integer bases $b>9$ for which $17_b$ is a divisor 
 
 def main():
     config = TechneConfig(
-        **{
-            "model": {"name_or_path": "Qwen/Qwen3-0.6B", "dtype": "bfloat16", "compile": False},
-            "rollout": {
-                "max_turns": 8,
+        model={"name_or_path": "Qwen/Qwen3-0.6B", "dtype": "bfloat16", "compile": False},
+        training={
+            "inference": {
+                "name_or_path": "Qwen/Qwen3-0.6B",
                 "max_new_tokens": 512,
                 "temperature": 0.6,
                 "top_p": 0.95,
                 "top_k": 50,
-            },
-        }
+            }
+        },
+        max_turns=8,
     )
 
     agent = MathToolAgent(config)

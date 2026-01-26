@@ -21,19 +21,7 @@ class MathReward:
                 return boxed_match.group(1).strip()
             return answer_part
 
-        # 3. Look for \boxed{...} outside tags (GSM8K fallback)
-        boxed_match = re.search(r"\\boxed\{([^}]+)\}", text)
-        if boxed_match:
-            return boxed_match.group(1).strip()
-
-        # 4. Look for "Answer: <value>" (Legacy/Fallback)
-        match = re.search(r"Answer:\s*(.*)", text, re.IGNORECASE)
-        if match:
-            return match.group(1).strip()
-
-        # Fallback: last number in text
-        numbers = re.findall(r"[-+]?\d*\.\d+|\d+", text)
-        return numbers[-1] if numbers else None
+        return None
 
     @staticmethod
     def is_correct(predicted: str, reference: str) -> bool:

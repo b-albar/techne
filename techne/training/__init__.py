@@ -6,20 +6,26 @@ Provides modular training utilities:
 - rl: Async RL training with Ray (GRPO/PPO/GSPO/DISTILL)
 - distill: Distillation training (offline)
 - data_gen: Distributed data generation with Ray
+- model: Abstract model interfaces (InferenceModel, TrainingModel)
 """
 
 from techne.training.data_gen import (
     GeneratedSample,
+    ModelFactory,
     generate_distill_data,
     generate_distill_data_sync,
     generate_sft_data,
     generate_sft_data_sync,
     samples_to_dataset,
 )
+from techne.training.model import InferenceModel, TrainingModel
 from techne.training.trainer import TechneTrainer
 
 __all__ = [
     "TechneTrainer",
+    "InferenceModel",
+    "TrainingModel",
+    "ModelFactory",
     "GeneratedSample",
     "generate_sft_data",
     "generate_sft_data_sync",

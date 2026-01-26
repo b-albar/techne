@@ -9,7 +9,7 @@ import asyncio
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING
 
 # Suppress Ray warnings
 os.environ.setdefault("RAY_DEDUP_LOGS", "0")
@@ -19,7 +19,11 @@ import ray  # noqa: E402
 import torch  # noqa: E402
 from tqdm.asyncio import tqdm  # noqa: E402
 
-from techne.training.model import LocalModel  # noqa: E402
+if TYPE_CHECKING:
+    from techne.training.model import InferenceModel
+
+# Type alias for model factories
+ModelFactory = Callable[[], "InferenceModel"]
 
 
 @dataclass
@@ -42,24 +46,18 @@ class GenerationWorker:
 
     def __init__(
         self,
-        model_name: str,
-        device: str = "cuda",
-        dtype: torch.dtype = torch.bfloat16,
+        model_factory: ModelFactory,
         max_new_tokens: int = 512,
         temperature: float = 0.7,
         top_p: float = 0.95,
     ):
-        self.device = device
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
         self.top_p = top_p
 
-        self.model = LocalModel.from_pretrained(
-            model_name,
-            device=device,
-            dtype=dtype,
-        )
-        self.tokenizer = self.model.tokenizer
+        self.model = model_factory()
+        self.tokenizer = self.model.get_tokenizer()
+        self.device = self.model.device
 
     def generate(self, prompts: list[str]) -> list[GeneratedSample]:
         """Generate completions for prompts."""
@@ -98,19 +96,10 @@ class GenerationWorker:
 class TeacherWorker:
     """Worker that computes teacher logprobs for distillation."""
 
-    def __init__(
-        self,
-        model_name: str,
-        device: str = "cuda",
-        dtype: torch.dtype = torch.bfloat16,
-    ):
-        self.device = device
-        self.model = LocalModel.from_pretrained(
-            model_name,
-            device=device,
-            dtype=dtype,
-        )
-        self.tokenizer = self.model.tokenizer
+    def __init__(self, model_factory: ModelFactory):
+        self.model = model_factory()
+        self.tokenizer = self.model.get_tokenizer()
+        self.device = self.model.device
 
     def compute_logprobs(self, samples: list[GeneratedSample]) -> list[GeneratedSample]:
         """Compute teacher logprobs for completions."""
@@ -123,26 +112,24 @@ class TeacherWorker:
 
 async def generate_sft_data(
     prompts: list[str],
-    model_name: str,
+    model_factory: ModelFactory,
     num_workers: int = 1,
     batch_size: int = 8,
     max_new_tokens: int = 512,
     temperature: float = 0.7,
     top_p: float = 0.95,
-    dtype: torch.dtype = torch.bfloat16,
     filter_fn: Callable[[GeneratedSample], bool] | None = None,
 ) -> list[GeneratedSample]:
     """Generate SFT training data using Ray workers.
 
     Args:
         prompts: List of prompts to generate completions for
-        model_name: HuggingFace model name/path
+        model_factory: Factory function that creates an InferenceModel
         num_workers: Number of generation workers
         batch_size: Prompts per worker batch
         max_new_tokens: Max tokens to generate
         temperature: Sampling temperature
         top_p: Top-p sampling
-        dtype: Model dtype
         filter_fn: Optional filter function to keep only good samples
 
     Returns:
@@ -157,13 +144,9 @@ async def generate_sft_data(
             _system_config={"metrics_report_interval_ms": 0},
         )
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
     workers = [
         GenerationWorker.remote(
-            model_name=model_name,
-            device=device,
-            dtype=dtype,
+            model_factory=model_factory,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             top_p=top_p,
@@ -199,15 +182,14 @@ async def generate_sft_data(
 
 async def generate_distill_data(
     prompts: list[str],
-    student_model_name: str,
-    teacher_model_name: str,
+    student_model_factory: ModelFactory,
+    teacher_model_factory: ModelFactory,
     num_gen_workers: int = 1,
     num_teacher_workers: int = 1,
     batch_size: int = 8,
     max_new_tokens: int = 512,
     temperature: float = 0.7,
     top_p: float = 0.95,
-    dtype: torch.dtype = torch.bfloat16,
     filter_fn: Callable[[GeneratedSample], bool] | None = None,
 ) -> list[GeneratedSample]:
     """Generate distillation training data using Ray workers.
@@ -216,15 +198,14 @@ async def generate_distill_data(
 
     Args:
         prompts: List of prompts
-        student_model_name: Student model for generation
-        teacher_model_name: Teacher model for logprobs
+        student_model_factory: Factory for student model (generation)
+        teacher_model_factory: Factory for teacher model (logprobs)
         num_gen_workers: Number of generation workers
         num_teacher_workers: Number of teacher workers
         batch_size: Prompts per worker batch
         max_new_tokens: Max tokens to generate
         temperature: Sampling temperature
         top_p: Top-p sampling
-        dtype: Model dtype
         filter_fn: Optional filter function
 
     Returns:
@@ -239,14 +220,10 @@ async def generate_distill_data(
             _system_config={"metrics_report_interval_ms": 0},
         )
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
     # Create workers
     gen_workers = [
         GenerationWorker.remote(
-            model_name=student_model_name,
-            device=device,
-            dtype=dtype,
+            model_factory=student_model_factory,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             top_p=top_p,
@@ -255,11 +232,7 @@ async def generate_distill_data(
     ]
 
     teacher_workers = [
-        TeacherWorker.remote(
-            model_name=teacher_model_name,
-            device=device,
-            dtype=dtype,
-        )
+        TeacherWorker.remote(model_factory=teacher_model_factory)
         for _ in range(num_teacher_workers)
     ]
 
@@ -341,20 +314,20 @@ def samples_to_dataset(
 # Convenience sync wrappers
 def generate_sft_data_sync(
     prompts: list[str],
-    model_name: str,
+    model_factory: ModelFactory,
     **kwargs,
 ) -> list[GeneratedSample]:
     """Sync wrapper for generate_sft_data."""
-    return asyncio.run(generate_sft_data(prompts, model_name, **kwargs))
+    return asyncio.run(generate_sft_data(prompts, model_factory, **kwargs))
 
 
 def generate_distill_data_sync(
     prompts: list[str],
-    student_model_name: str,
-    teacher_model_name: str,
+    student_model_factory: ModelFactory,
+    teacher_model_factory: ModelFactory,
     **kwargs,
 ) -> list[GeneratedSample]:
     """Sync wrapper for generate_distill_data."""
     return asyncio.run(
-        generate_distill_data(prompts, student_model_name, teacher_model_name, **kwargs)
+        generate_distill_data(prompts, student_model_factory, teacher_model_factory, **kwargs)
     )

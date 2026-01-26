@@ -57,13 +57,19 @@ class Trajectory(BaseModel):
         """Sum of all rewards in the trajectory."""
         return sum(s.reward for s in self.steps if s.reward is not None)
 
-    def get_all_token_ids(self) -> list[int]:
+    @property
+    def all_token_ids(self) -> list[int]:
         """Flatten token IDs from all steps."""
         ids = []
         for s in self.steps:
             if s.token_ids:
                 ids.extend(s.token_ids)
         return ids
+
+    @property
+    def total_tokens(self) -> int:
+        """Total number of tokens in the trajectory."""
+        return len(self.all_token_ids)
 
     def to_text(self) -> str:
         """Get the full text content of the trajectory."""

@@ -10,7 +10,7 @@ from techne.config import TechneConfig
 
 async def run_test(args):
     # 1. Initialize Config
-    config = TechneConfig(model={"name_or_path": args.model}, rollout={"max_turns": args.max_turns})
+    config = TechneConfig(model={"name_or_path": args.model}, max_turns=args.max_turns)
 
     # 2. Force backend if requested
     if args.backend == "huggingface" and "OPENAI_API_KEY" in os.environ:

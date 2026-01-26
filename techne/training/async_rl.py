@@ -31,10 +31,12 @@ import ray  # noqa: E402
 import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402, N812
 from tqdm.auto import tqdm  # noqa: E402
-from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: E402
 
-from techne.config import DistributedBackend, TechneConfig  # noqa: E402
-from techne.training.model import LocalModel  # noqa: E402
+from techne.config import DistributedBackend, InferenceConfig, TechneConfig  # noqa: E402
+from techne.training.model import InferenceModel  # noqa: E402
+
+# Type alias for model factories
+ModelFactory = Callable[[], InferenceModel]
 
 
 def get_merged_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
@@ -159,9 +161,7 @@ class InferenceWorker:
 
     def __init__(
         self,
-        model_name: str,
-        device: str = "cuda",
-        dtype: torch.dtype = torch.bfloat16,
+        model_factory: ModelFactory,
         num_generations: int = 4,
         max_new_tokens: int = 512,
         temperature: float = 0.7,
@@ -169,19 +169,15 @@ class InferenceWorker:
         agent_config: TechneConfig | None = None,
         reward_fn_class: type | None = None,
     ):
-        self.device = device
         self.num_generations = num_generations
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
         self.agent_class = agent_class
         self.agent_config = agent_config
 
-        self.model = LocalModel.from_pretrained(
-            model_name,
-            device=device,
-            dtype=dtype,
-        )
-        self.tokenizer = self.model.tokenizer
+        self.model = model_factory()
+        self.tokenizer = self.model.get_tokenizer()
+        self.device = self.model.device
 
         # Initialize agent if class provided
         if self.agent_class:
@@ -304,10 +300,9 @@ class TrainingWorker:
 
     def __init__(
         self,
-        model_name: str,
+        inference_config: InferenceConfig,
         rank: int,
         world_size: int,
-        dtype: torch.dtype = torch.bfloat16,
         distributed_backend: DistributedBackend = DistributedBackend.NONE,
     ):
         import os
@@ -325,12 +320,10 @@ class TrainingWorker:
 
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP  # noqa: N817
 
-            base_model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                dtype=dtype,
-                trust_remote_code=True,
-            )
-            self.model = FSDP(base_model.cuda())
+            # Create base model via config, then wrap with FSDP
+            base_model = inference_config.create_training_model()
+            self.model = FSDP(base_model._model.cuda())
+            self.tokenizer = base_model.get_tokenizer()
         elif distributed_backend == DistributedBackend.DDP:
             os.environ["RANK"] = str(rank)
             os.environ["WORLD_SIZE"] = str(world_size)
@@ -338,21 +331,17 @@ class TrainingWorker:
             os.environ["MASTER_PORT"] = "29500"
             torch.distributed.init_process_group("nccl", rank=rank, world_size=world_size)
 
-            base_model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                dtype=dtype,
-                trust_remote_code=True,
-            ).cuda(rank)
-            self.model = torch.nn.parallel.DistributedDataParallel(base_model, device_ids=[rank])
-        else:
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                dtype=dtype,
-                device_map="cuda",
-                trust_remote_code=True,
+            # Create base model via config, then wrap with DDP
+            base_model = inference_config.create_training_model()
+            self.model = torch.nn.parallel.DistributedDataParallel(
+                base_model._model.cuda(rank), device_ids=[rank]
             )
+            self.tokenizer = base_model.get_tokenizer()
+        else:
+            training_model = inference_config.create_training_model()
+            self.model = training_model._model
+            self.tokenizer = training_model.get_tokenizer()
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
@@ -701,7 +690,7 @@ class DynamicBatcher:
 def compute_rl_loss(
     model: torch.nn.Module,
     batch: Minibatch,
-    tokenizer: AutoTokenizer,
+    tokenizer: Any,
     device: str = "cuda",
     algorithm: str = "grpo",
     clip_eps: float = 0.2,
@@ -850,7 +839,7 @@ def compute_rl_loss(
 async def train_async_rl(
     config: TechneConfig,
     model: torch.nn.Module,
-    tokenizer: AutoTokenizer,
+    tokenizer: Any,
     dataset: Any,
     reward_fn_class: type | None = None,
     algorithm: str = "grpo",
@@ -941,14 +930,13 @@ async def train_async_rl(
         gpu_per_worker = 0
 
     # Create inference workers
+    inference_config = config.get_inference_config(device=device)
     inference_workers = [
         InferenceWorker.options(num_gpus=gpu_per_worker).remote(
-            model_name=config.model.name_or_path,
-            device=device,
-            dtype=config.model.dtype,
+            model_factory=inference_config.create_model_factory(for_training=False),
             num_generations=num_generations,
-            max_new_tokens=config.training.max_seq_length // 2,
-            temperature=config.rollout.temperature,
+            max_new_tokens=inference_config.max_new_tokens,
+            temperature=inference_config.temperature,
             agent_class=agent_class,
             agent_config=config,
             reward_fn_class=reward_fn_class,
@@ -961,10 +949,9 @@ async def train_async_rl(
     if use_distributed:
         training_workers = [
             TrainingWorker.options(num_gpus=gpu_per_worker).remote(
-                model_name=config.model.name_or_path,
+                inference_config=inference_config,
                 rank=i,
                 world_size=num_training_workers,
-                dtype=config.model.dtype,
                 distributed_backend=distributed_backend,
             )
             for i in range(num_training_workers)

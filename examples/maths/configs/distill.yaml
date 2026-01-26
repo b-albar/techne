@@ -1,26 +1,48 @@
+# Distillation Training Configuration
+
 model:
-  name_or_path: "Qwen/Qwen2.5-0.5B-Instruct"
+  name_or_path: "Qwen/Qwen3-0.6B"
   dtype: "bfloat16"
-  attn_implementation: "eager"
+  attn_implementation: "sdpa"
+  trust_remote_code: true
+  compile: true
+  lora:
+    enabled: true
+    r: 16
+    alpha: 32
+    dropout: 0.05
+    target_modules:
+      - q_proj
+      - v_proj
 
 training:
   algorithm: "distill"
-  teacher_model: "Qwen/Qwen2.5-0.5B-Instruct" # Using same model as teacher for testing
   learning_rate: 1.0e-6
   batch_size: 4
   max_steps: 100
-  num_inference_workers: 1
-  num_training_workers: 1
-  distributed_backend: "none"
   max_seq_length: 1024
   num_generations: 2
   kl_coef: 0.1
   clip_eps: 0.2
+  num_inference_workers: 1
+  num_training_workers: 1
+  distributed_backend: "none"
+  teacher:
+    name_or_path: "Qwen/Qwen3-0.6B"
+    dtype: "bfloat16"
+    temperature: 0.6
+    top_k: 50
+    top_p: 0.95
 
-rollout:
-  temperature: 0.7
-  response_length: 512
+  inference:
+    name_or_path: "Qwen/Qwen3-0.6B"
+    temperature: 0.6
+    max_new_tokens: 512
+    top_k: 50
+    top_p: 0.95
 
+max_turns: 5
 output_dir: "outputs/distill_run"
+seed: 42
 logging_steps: 10
 save_steps: 50

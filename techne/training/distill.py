@@ -14,15 +14,16 @@ import torch.nn.functional as F
 from transformers import PreTrainedModel, PreTrainedTokenizer
 from trl import SFTConfig, SFTTrainer
 
-from techne.config import DistillationMode, TechneConfig
+from techne.config import AlignerType, DistillationMode, TechneConfig
 from techne.data import Trajectory
 from techne.training.alignment import DirectAligner, GoldAligner
 from techne.training.estimators import (
+    AKDEstimator,
     ForwardKLEstimator,
+    ReverseKLEstimator,
     SlimEstimator,
     SparseLogits,
 )
-from techne.training.model import create_teacher_model
 from techne.training.sft import get_common_training_args
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,22 @@ def are_tokenizers_identical(
     return s_enc == t_enc
 
 
+def create_aligner(
+    aligner_type: AlignerType,
+    student_tokenizer: PreTrainedTokenizer,
+    teacher_tokenizer: PreTrainedTokenizer,
+) -> DirectAligner | GoldAligner:
+    """Create the appropriate aligner based on config and tokenizer identity."""
+    if aligner_type == AlignerType.AUTO:
+        use_direct = are_tokenizers_identical(student_tokenizer, teacher_tokenizer)
+    else:
+        use_direct = aligner_type == AlignerType.DIRECT
+
+    if use_direct:
+        return DirectAligner(student_tokenizer, teacher_tokenizer)
+    return GoldAligner(student_tokenizer, teacher_tokenizer)
+
+
 # =============================================================================
 # Offline Distillation Training
 # =============================================================================
@@ -62,8 +79,8 @@ def train_distill_offline(
     """Standard offline distillation: train student on teacher completions.
 
     Supports:
-    - SFT-style training on teacher outputs (when no teacher_model specified)
-    - KL divergence loss from teacher logits (when teacher_model specified)
+    - SFT-style training on teacher outputs (when no teacher config specified)
+    - KL divergence loss from teacher logits (when teacher config specified)
     - Different tokenizers (GOLD approach: decode and re-tokenize)
 
     Args:
@@ -76,7 +93,7 @@ def train_distill_offline(
     Returns:
         Training result
     """
-    teacher_model_path = config.training.teacher_model
+    teacher_config = config.training.teacher
 
     # Data Validation
     assert len(dataset) > 0, "Distillation dataset is empty!"
@@ -106,7 +123,6 @@ def train_distill_offline(
     if len(trajectories) == 0:
         raise ValueError("No valid Trajectories found in dataset!")
 
-
     # 2. Prepare for Distillation (KL Loss)
     logger.info("Preparing distillation dataset from Trajectories...")
     processed_samples = []
@@ -128,29 +144,28 @@ def train_distill_offline(
     # Load teacher model only if needed (not all samples have cached logprobs)
     teacher_model = None
     teacher_tokenizer = None
-    same_tokenizer = True
 
     if all_have_logprobs:
         logger.info("All %d samples have cached teacher logprobs - skipping teacher model load", len(dataset))
     else:
-        if not teacher_model_path:
+        if teacher_config is None:
             raise ValueError(
                 "Distillation requires either cached logprobs in trajectories "
-                "or a teacher model path in config."
+                "or a teacher config in training.teacher."
             )
-        logger.info("Loading teacher model for logit distillation: %s", teacher_model_path)
-        teacher_model = create_teacher_model(
-            teacher_model_path,
-            device="auto",
-            dtype=config.model.dtype,
-        )
-        teacher_tokenizer = teacher_model.tokenizer
-        same_tokenizer = are_tokenizers_identical(tokenizer, teacher_tokenizer)
+        logger.info("Loading teacher model for logit distillation: %s", teacher_config.name_or_path)
+        teacher_model = teacher_config.create_inference_model()
+        teacher_model.eval()
+        teacher_tokenizer = teacher_model.get_tokenizer()
 
-        if same_tokenizer:
-            logger.info("Tokenizers are identical - using direct logit alignment")
+        aligner_type = config.training.aligner_type
+        if aligner_type == AlignerType.AUTO:
+            if are_tokenizers_identical(tokenizer, teacher_tokenizer):
+                logger.info("Tokenizers are identical - using direct alignment")
+            else:
+                logger.info("Different tokenizers detected - using GOLD alignment")
         else:
-            logger.info("Different tokenizers detected - using GOLD approach (decode & re-tokenize)")
+            logger.info("Using %s alignment (from config)", aligner_type.value)
 
     # Create trainer config
     args_dict = get_common_training_args(config)
@@ -164,9 +179,10 @@ def train_distill_offline(
         teacher=teacher_model,
         teacher_tokenizer=teacher_tokenizer,
         student_tokenizer=tokenizer,
-        same_tokenizer=same_tokenizer,
+        aligner_type=config.training.aligner_type,
         kl_weight=config.training.kl_weight,
         distillation_mode=config.training.distillation_mode,
+        temperature=config.training.distillation_temperature,
         slim_top_k=config.training.slim_top_k,
         model=model,
         args=args,
@@ -187,11 +203,15 @@ def compute_distillation_reward(
     max_length: int = 2048,
     use_kl: bool = False,
     student_logits: torch.Tensor | None = None,
+    aligner_type: AlignerType = AlignerType.AUTO,
 ) -> float:
     """Compute distillation reward.
 
     If use_kl is False (default): Uses Teacher Log-Likelihood of the completion.
     If use_kl is True: Uses -KL(Student || Teacher) (requires student_logits and alignment).
+
+    Args:
+        aligner_type: Alignment strategy (auto, direct, or gold).
     """
     full_text = prompt_text + completion_text
 
@@ -221,16 +241,9 @@ def compute_distillation_reward(
     s_ids = student_tokenizer(full_text, return_tensors="pt").input_ids[0]
     t_ids = teacher_inputs.input_ids[0]
 
-    # Select aligner based on tokenizer identity
-    if are_tokenizers_identical(student_tokenizer, teacher_tokenizer):
-        aligner = DirectAligner(student_tokenizer, teacher_tokenizer)
-    else:
-        aligner = GoldAligner(student_tokenizer, teacher_tokenizer)
+    aligner = create_aligner(aligner_type, student_tokenizer, teacher_tokenizer)
 
     # Compute KL loss (scalar)
-    # Note: student_logits might need to be computed for full_text if only passed for generation
-    # Here we assume caller passed valid logits
-
     kl = aligner.compute_kl_loss(
         student_logits.unsqueeze(0), teacher_outputs.logits, s_ids.unsqueeze(0), t_ids.unsqueeze(0)
     )
@@ -245,10 +258,11 @@ class _DistillationTrainer(SFTTrainer):
         teacher,
         teacher_tokenizer,
         student_tokenizer,
-        same_tokenizer: bool,
+        aligner_type: AlignerType = AlignerType.AUTO,
         kl_weight: float = 0.5,
         distillation_mode: DistillationMode = DistillationMode.FORWARD_KL,
-        slim_top_k: int | None = None,
+        temperature: float = 2.0,
+        slim_top_k: int = 100,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -257,21 +271,23 @@ class _DistillationTrainer(SFTTrainer):
         self.student_tokenizer = student_tokenizer
         self.kl_weight = kl_weight
         self.distillation_mode = distillation_mode
+        self.temperature = temperature
         self.slim_top_k = slim_top_k
 
         # Aligner only needed if we have a teacher model
         self.aligner = None
         if teacher is not None:
-            if same_tokenizer:
-                self.aligner = DirectAligner(student_tokenizer, teacher_tokenizer)
-            else:
-                self.aligner = GoldAligner(student_tokenizer, teacher_tokenizer)
+            self.aligner = create_aligner(aligner_type, student_tokenizer, teacher_tokenizer)
 
-        # Initialize Estimator
+        # Initialize Estimator based on distillation mode
         if distillation_mode == DistillationMode.SLIM:
-            self.estimator = SlimEstimator(temperature=2.0)
-        else:
-            self.estimator = ForwardKLEstimator(temperature=2.0)
+            self.estimator = SlimEstimator(temperature=temperature)
+        elif distillation_mode == DistillationMode.REVERSE_KL:
+            self.estimator = ReverseKLEstimator(temperature=temperature)
+        elif distillation_mode == DistillationMode.AKD:
+            self.estimator = AKDEstimator(temperature=temperature)
+        else:  # FORWARD_KL (default)
+            self.estimator = ForwardKLEstimator(temperature=temperature)
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         outputs = model(**inputs)
@@ -352,8 +368,7 @@ class _DistillationTrainer(SFTTrainer):
 
                 # Prepare Teacher Data (Sparse or Dense)
                 if self.distillation_mode == DistillationMode.SLIM:
-                    k = self.slim_top_k or 100
-                    vals, idxs = t_logits.topk(k, dim=-1)
+                    vals, idxs = t_logits.topk(self.slim_top_k, dim=-1)
                     teacher_data = SparseLogits(indices=idxs, values=vals)
                 else:
                     teacher_data = t_logits
@@ -394,5 +409,5 @@ class _DistillationTrainer(SFTTrainer):
                     teacher_outputs.logits,
                     inputs["input_ids"],
                     teacher_inputs["input_ids"],
-                    temperature=2.0,
+                    temperature=self.temperature,
                 )

@@ -1,48 +1,70 @@
-from unittest.mock import MagicMock
-
 from techne.data import Step, Trajectory
-from techne.memory.verlog import VerlogMemoryTransform
+from techne.memory.verlog import VerlogMemory
 
 
-def test_verlog_mechanism():
-    print("Testing Verlog Memory Mechanism...")
+def test_verlog_truncate():
+    """Test basic trajectory truncation."""
+    traj = Trajectory(metadata={"id": "test"})
 
-    # 1. Create a dummy trajectory with 5 turns
-    # Turn structure: User -> Assistant -> User -> Assistant ...
-    traj = Trajectory(metadata={"id": "test_traj"})
-
-    # 5 turns (0 to 4)
+    # Create 5 turns
     for i in range(5):
         traj.add_step(Step(role="user", content=f"Observation {i} "))
-        traj.add_step(Step(role="assistant", content=f"Thought {i} Action {i} ", trainable=True))
+        traj.add_step(Step(role="assistant", content=f"Action {i} ", trainable=True))
 
-    print(f"Created trajectory with {len(traj.steps)} steps.")
+    memory = VerlogMemory(n_turns_history=2)
 
-    # 2. Apply Verlog Transform (n=2 history)
-    # Turn 0: Hist=[], Main=Turn0
-    # Turn 1: Hist=[Turn0], Main=Turn1
-    # Turn 2: Hist=[Turn0, Turn1], Main=Turn2
-    # Turn 3: Hist=[Turn1, Turn2], Main=Turn3 (Window shift)
+    # Truncate to last 2 turns
+    truncated = memory.truncate(traj)
 
-    transform = VerlogMemoryTransform(n_turns_history=2)
+    # Should have 2 turns = 4 steps (user + assistant each)
+    assert len(truncated.steps) == 4
+    assert "Observation 3" in truncated.steps[0].content
+    assert "Observation 4" in truncated.steps[2].content
 
-    # Mock Tokenizer
-    tokenizer = MagicMock()
-    tokenizer.encode.side_effect = lambda x: [len(x)]  # return length as mock id
 
-    samples = transform.process([traj], tokenizer)
+def test_verlog_expand():
+    """Test expanding trajectory into per-turn samples."""
+    traj = Trajectory(metadata={"id": "test"})
 
-    print(f"Generated {len(samples)} training samples.")
-    assert len(samples) == 5, f"Expected 5 samples, got {len(samples)}"
+    # Create 5 turns
+    for i in range(5):
+        traj.add_step(Step(role="user", content=f"Observation {i} "))
+        traj.add_step(Step(role="assistant", content=f"Action {i} ", trainable=True))
 
-    # Verify Windowing
-    # Sample 3 (Turn 3) should have history [Turn 1, Turn 2]
-    # Content should be: Obs 1 ... Obs 2 ... Obs 3 ...
-    # Let's inspect the logic (we can't easily inspect content without a real tokenizer,
-    # but we can rely on our logic check).
+    memory = VerlogMemory(n_turns_history=2)
+    expanded = memory.expand(traj)
 
-    print("Verlog Memory Mechanism test passed (Logic flow).")
+    # Should get 5 trajectories (one per turn)
+    assert len(expanded) == 5
+
+    # First turn has no history
+    assert len(expanded[0].steps) == 2
+
+    # Third turn has 2 turns of history + current = 3 turns = 6 steps
+    assert len(expanded[2].steps) == 6
+
+    # Fifth turn also has 2 turns history + current = 6 steps
+    assert len(expanded[4].steps) == 6
+
+    # Metadata should include turn info
+    assert expanded[2].metadata["turn_index"] == 2
+    assert expanded[2].metadata["total_turns"] == 5
+
+
+def test_verlog_empty_trajectory():
+    """Test handling of empty trajectory."""
+    traj = Trajectory(metadata={"id": "empty"})
+    memory = VerlogMemory(n_turns_history=2)
+
+    truncated = memory.truncate(traj)
+    assert len(truncated.steps) == 0
+
+    expanded = memory.expand(traj)
+    assert len(expanded) == 0
 
 
 if __name__ == "__main__":
-    test_verlog_mechanism()
+    test_verlog_truncate()
+    test_verlog_expand()
+    test_verlog_empty_trajectory()
+    print("All Verlog tests passed.")

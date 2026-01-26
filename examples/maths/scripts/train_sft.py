@@ -20,10 +20,12 @@ async def main():
     # 2. Load Data (ReTool SFT)
     print(f"Loading SFT dataset from {args.dataset}...")
     try:
-        data_path = args.dataset
-        ds = load_from_disk(data_path)
+        ds = load_from_disk(args.dataset)
+        # Handle both DatasetDict (with splits) and flat Dataset
         if hasattr(ds, "keys") and "train" in ds:
             train_dataset = ds["train"]
+        else:
+            train_dataset = ds
     except Exception as e:
         print(f"Error loading dataset: {e}")
         exit(1)

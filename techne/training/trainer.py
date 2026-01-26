@@ -14,7 +14,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from techne.config import TechneConfig, TrainingAlgorithm
 from techne.data import TrainingSample, Trajectory
-from techne.transform import FullHistoryTransform, TrajectoryTransform
 
 logger = logging.getLogger(__name__)
 
@@ -22,9 +21,8 @@ logger = logging.getLogger(__name__)
 class TechneTrainer:
     """Simple unified trainer wrapper."""
 
-    def __init__(self, config: TechneConfig, transform: TrajectoryTransform | None = None):
+    def __init__(self, config: TechneConfig):
         self.config = config
-        self.transform = transform or FullHistoryTransform()
 
         # Load model
         self.model = AutoModelForCausalLM.from_pretrained(
@@ -94,12 +92,7 @@ class TechneTrainer:
             logger.warning("No data provided for training.")
             return
 
-        # Process trajectories if needed
         samples = data
-        # We now prefer to let get_sft_trainer handle Trajectories directly to support
-        # correct multi-turn masking (which FullHistoryTransform doesn't fully support yet).
-        # if isinstance(data, list) and len(data) > 0 and isinstance(data[0], Trajectory):
-        #     samples = self.transform.process(data, self.tokenizer)
 
         from techne.training.sft import get_sft_trainer
 
