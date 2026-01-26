@@ -17,19 +17,8 @@ from techne.config import TechneConfig
 class EvaluationWorker:
     """Distributed worker for evaluating MathToolAgent."""
 
-    def __init__(self, config_path: str, model_name: str, torch_compile: bool = False):
-        self.config = (
-            TechneConfig.from_yaml(config_path)
-            if os.path.exists(config_path)
-            else TechneConfig(model={"name_or_path": model_name})
-        )
-        self.config.model.name_or_path = model_name
-        self.config.model.compile = torch_compile
-
-        # Force eager attention for evaluation if not specified or problems arise
-        # (similar to what we did for distillation)
-        if not hasattr(self.config.model, "attn_implementation"):
-            self.config.model.attn_implementation = "eager"
+    def __init__(self, config: TechneConfig):
+        self.config = config
 
         # Initialize Agent (which loads model/tokenizer)
         self.agent = MathToolAgent(self.config)
@@ -77,24 +66,25 @@ class EvaluationWorker:
         return results
 
     def _extract_qa(self, example):
-        """Extract question and answer from common math dataset formats."""
-        # 1. Answer extraction first (easier)
-        a = example.get("answer") or example.get("solution") or example.get("ground_truth")
-        if not a and "reward_model" in example:
-            rm = example["reward_model"]
-            a = rm.get("ground_truth") if isinstance(rm, dict) else None
-
-        # 2. Question/Prompt extraction
-        q = example.get("prompt")
-
-        # Fallback to string keys
-        if not q:
-            q = example.get("question") or example.get("problem") or example.get("problem_content")
-
+        """Extract question and answer."""
+        q = example.get("question") or example.get("prompt")
+        a = example.get("answer") or example.get("solution")
         return q, a
 
 
 async def run_distributed_evaluation(args):
+    # 0. Prepare Config
+    config = (
+        TechneConfig.from_yaml(args.config)
+        if os.path.exists(args.config)
+        else TechneConfig(model={"name_or_path": args.model})
+    )
+    config.model.name_or_path = args.model
+    config.model.compile = args.torch_compile
+    # Force eager attention for evaluation if not specified
+    if not hasattr(config.model, "attn_implementation"):
+        config.model.attn_implementation = "eager"
+
     # 1. Initialize Ray
     if not ray.is_initialized():
         ray.init(
@@ -113,29 +103,13 @@ async def run_distributed_evaluation(args):
     # 2. Create Workers
     print(f"Initializing {num_workers} workers with {gpu_per_worker:.2f} GPU each...")
     workers = [
-        EvaluationWorker.options(num_gpus=gpu_per_worker).remote(
-            args.config, args.model, args.torch_compile
-        )
-        for _ in range(num_workers)
+        EvaluationWorker.options(num_gpus=gpu_per_worker).remote(config) for _ in range(num_workers)
     ]
 
     # 3. Load Data
     data_path = Path(args.dataset)
-    if not data_path.exists():
-        # Try relative to project root or examples dir
-        possibilities = [
-            Path("examples/maths") / args.dataset,
-            Path(__file__).parent.parent / args.dataset,
-            Path(__file__).parent.parent / "data" / args.dataset
-            if "data" not in args.dataset
-            else None,
-        ]
-        for p in possibilities:
-            if p and p.exists():
-                data_path = p
-                break
-
     print(f"Loading dataset from: {data_path}")
+
     if data_path.exists():
         ds = load_from_disk(str(data_path))
         eval_data = ds["test"] if "test" in ds else (ds["train"] if "train" in ds else ds)
@@ -146,21 +120,10 @@ async def run_distributed_evaluation(args):
         eval_data = eval_data.select(range(min(args.max_samples, len(eval_data))))
 
     # 4. Distribute Work
-    total = len(eval_data)
+    data_list = eval_data.to_list()
+    total = len(data_list)
     batch_size = (total + num_workers - 1) // num_workers
-    batches = [eval_data[i : i + batch_size] for i in range(0, total, batch_size)]
-
-    # Convert HF dataset slices to list of dicts for Ray serialization
-    batches_list = []
-    for i in range(0, total, batch_size):
-        # HuggingFace Dataset slicing returns a dict of lists {col: [vals]},
-        # we want list of dicts [{col: val}, ...]
-        slice_dict = eval_data[i : i + batch_size]
-        # Transpose
-        keys = list(slice_dict.keys())
-        num_items = len(slice_dict[keys[0]])
-        items = [{k: slice_dict[k][j] for k in keys} for j in range(num_items)]
-        batches_list.append(items)
+    batches_list = [data_list[i : i + batch_size] for i in range(0, total, batch_size)]
 
     print(f"Starting distributed evaluation on {total} samples across {len(workers)} workers...")
 
@@ -170,13 +133,18 @@ async def run_distributed_evaluation(args):
         worker = workers[i % len(workers)]
         futures.append(worker.evaluate_batch.remote(batch))
 
-    # 5. Collect Results
-    results_flat = []
+    import tqdm
 
     # Wrap Ray ObjectRefs into asyncio futures
-    completed = await asyncio.gather(*[asyncio.wrap_future(f.future()) for f in futures])
+    async_futures = [asyncio.wrap_future(f.future()) for f in futures]
 
-    for batch_results in completed:
+    # 5. Collect Results with Progress Bar
+    results_flat = []
+    print("\nWaiting for results...")
+    for f in tqdm.tqdm(
+        asyncio.as_completed(async_futures), total=len(async_futures), desc="Evaluating batches"
+    ):
+        batch_results = await f
         results_flat.extend(batch_results)
 
     # 6. Report

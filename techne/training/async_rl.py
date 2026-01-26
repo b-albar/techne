@@ -13,10 +13,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from queue import Empty, Queue
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -367,6 +367,7 @@ class TrainingWorker:
         kl_coef: float,
         lr: float,
         weight_decay: float,
+        clip_range_ratio: list[float] | None = None,
     ) -> tuple[dict, dict]:
         """Execute a training step and return metrics + new optimizer state."""
         if optimizer_state is None:
@@ -387,6 +388,7 @@ class TrainingWorker:
             algorithm=algorithm,
             clip_eps=clip_eps,
             kl_coef=kl_coef,
+            clip_range_ratio=clip_range_ratio,
         )
 
         loss.backward()
@@ -451,7 +453,9 @@ def should_skip_batch(samples: list[Sample], min_advantage_std: float = 1e-6) ->
     advantages = [s.advantage for s in samples]
     if not advantages:
         return True
-    std = (sum((a - sum(advantages) / len(advantages)) ** 2 for a in advantages) / len(advantages)) ** 0.5
+    std = (
+        sum((a - sum(advantages) / len(advantages)) ** 2 for a in advantages) / len(advantages)
+    ) ** 0.5
     return std < min_advantage_std
 
 
@@ -588,7 +592,7 @@ class DynamicBatcher:
                 self._response_lengths.append(len(s.completion_ids))
             # Keep only recent history
             if len(self._response_lengths) > self._max_response_history:
-                self._response_lengths = self._response_lengths[-self._max_response_history:]
+                self._response_lengths = self._response_lengths[-self._max_response_history :]
 
             await self.cache.push(samples)
         except Exception as e:
@@ -617,7 +621,8 @@ class DynamicBatcher:
             # Filter stale samples if staleness tracking is enabled
             if current_policy_version is not None and self.staleness_threshold > 0:
                 fresh_samples = [
-                    s for s in batch
+                    s
+                    for s in batch
                     if current_policy_version - s.policy_version <= self.staleness_threshold
                 ]
                 stale_count = len(batch) - len(fresh_samples)
@@ -628,7 +633,7 @@ class DynamicBatcher:
                         for s in fresh_samples:
                             await self.cache.push_one(s)
                         continue
-                    batch = fresh_samples[:self.minibatch_size]
+                    batch = fresh_samples[: self.minibatch_size]
 
             # Skip zero-gradient batches (Open-Instruct active sampling filter)
             if skip_zero_gradient and should_skip_batch(batch):
@@ -693,62 +698,6 @@ class DynamicBatcher:
         }
 
 
-@ray.remote
-class ExperienceBatcher:
-    """Collects samples and prepares minibatches."""
-
-    def __init__(self, minibatch_size: int = 8):
-        self.minibatch_size = minibatch_size
-        self.sample_buffer: list[Sample] = []
-        self.ready_batches: Queue[Minibatch] = Queue()
-
-    def add_samples(self, samples: list[Sample]):
-        """Add samples and compute advantages within groups."""
-        # Group by prompt for advantage computation (GRPO style)
-        prompt_groups: dict[any, list[Sample]] = {}
-        for s in samples:
-            # Handle unhashable prompts (e.g. list of messages)
-            if isinstance(s.prompt, list):
-                # Convert list of dicts to tuple of frozensets (hashable)
-                key = tuple(frozenset(d.items()) for d in s.prompt)
-            else:
-                key = s.prompt
-
-            if key not in prompt_groups:
-                prompt_groups[key] = []
-            prompt_groups[key].append(s)
-
-        for group in prompt_groups.values():
-            rewards = [s.reward for s in group]
-            mean_r = sum(rewards) / len(rewards) if rewards else 0.0
-            std_r = (
-                (sum((r - mean_r) ** 2 for r in rewards) / len(rewards)) ** 0.5
-                if len(rewards) > 1
-                else 1.0
-            )
-            std_r = max(std_r, 1e-8)
-
-            for s in group:
-                s.advantage = (s.reward - mean_r) / std_r
-
-        self.sample_buffer.extend(samples)
-        self._maybe_flush()
-
-    def _maybe_flush(self):
-        """Create minibatch if enough samples."""
-        while len(self.sample_buffer) >= self.minibatch_size:
-            batch_samples = self.sample_buffer[: self.minibatch_size]
-            self.sample_buffer = self.sample_buffer[self.minibatch_size :]
-            self.ready_batches.put(Minibatch(samples=batch_samples))
-
-    def get_batch(self, timeout: float = 1.0) -> Minibatch | None:
-        """Get a ready minibatch."""
-        try:
-            return self.ready_batches.get(timeout=timeout)
-        except Empty:
-            return None
-
-
 def compute_rl_loss(
     model: torch.nn.Module,
     batch: Minibatch,
@@ -757,6 +706,7 @@ def compute_rl_loss(
     algorithm: str = "grpo",
     clip_eps: float = 0.2,
     kl_coef: float = 0.1,
+    clip_range_ratio: list[float] | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """Compute RL loss for a minibatch.
 
@@ -770,6 +720,7 @@ def compute_rl_loss(
         algorithm: "grpo", "ppo", or "gspo"
         clip_eps: Clipping epsilon
         kl_coef: KL penalty coefficient
+        clip_range_ratio: Optional list [min, max] to override clip_eps
 
     Returns:
         loss, metrics dict
@@ -830,7 +781,11 @@ def compute_rl_loss(
     # Algorithm-specific loss
     if algorithm == "ppo":
         # PPO: clip ratio, multiply by advantage
-        clipped_ratio = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps)
+        if clip_range_ratio is not None:
+            clipped_ratio = torch.clamp(ratio, clip_range_ratio[0], clip_range_ratio[1])
+        else:
+            clipped_ratio = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps)
+
         adv_expanded = advantages.unsqueeze(1).expand(-1, seq_len)
         loss1 = -adv_expanded * ratio
         loss2 = -adv_expanded * clipped_ratio
@@ -845,7 +800,10 @@ def compute_rl_loss(
 
     else:  # grpo (default)
         # GRPO: standard PPO-style clipping
-        clipped_ratio = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps)
+        if clip_range_ratio is not None:
+            clipped_ratio = torch.clamp(ratio, clip_range_ratio[0], clip_range_ratio[1])
+        else:
+            clipped_ratio = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps)
         adv_expanded = advantages.unsqueeze(1).expand(-1, seq_len)
         loss1 = -adv_expanded * ratio
         loss2 = -adv_expanded * clipped_ratio
@@ -858,12 +816,32 @@ def compute_rl_loss(
     # Masked mean
     masked_loss = (total_loss * mask).sum() / mask.sum().clamp(min=1)
 
+    # Compute entropy of policy distribution (measures exploration)
+    probs = F.softmax(logits[:, :-1, :], dim=-1)
+    entropy = -(probs * log_probs[:, :-1, :]).sum(dim=-1)  # [B, S]
+    masked_entropy = (entropy * mask).sum() / mask.sum().clamp(min=1)
+
+    # Compute clipping statistics
+    if algorithm in ("ppo", "grpo"):
+        clipped = (ratio < 1 - clip_eps) | (ratio > 1 + clip_eps)
+        clip_fraction = (clipped * mask).sum().item() / mask.sum().clamp(min=1).item()
+    else:
+        clip_fraction = 0.0
+
+    # Response length statistics
+    response_lengths = [len(s.completion_ids) for s in batch.samples]
+    mean_response_len = sum(response_lengths) / len(response_lengths)
+
     metrics = {
         "loss": masked_loss.item(),
         "policy_loss": (policy_loss * mask).sum().item() / mask.sum().clamp(min=1).item(),
         "kl": (kl * mask).sum().item() / mask.sum().clamp(min=1).item(),
+        "entropy": masked_entropy.item(),
         "mean_advantage": advantages.mean().item(),
         "mean_reward": sum(s.reward for s in batch.samples) / len(batch.samples),
+        "response_len": mean_response_len,
+        "ratio_mean": (ratio * mask).sum().item() / mask.sum().clamp(min=1).item(),
+        "clip_frac": clip_fraction,
     }
 
     return masked_loss, metrics
@@ -908,10 +886,12 @@ async def train_async_rl(
     num_training_workers = config.training.num_training_workers
     distributed_backend = config.training.distributed_backend
     num_generations = config.training.num_generations
-    minibatch_size = config.training.batch_size
+    per_gpu_batch_size = config.training.batch_size
     gradient_accumulation_steps = config.training.gradient_accumulation_steps
     clip_eps = config.training.clip_eps
+    clip_range_ratio = config.training.clip_range_ratio
     kl_coef = config.training.kl_coef
+    ppo_epochs = config.training.ppo_epochs
     sync_weights_interval = config.training.sync_weights_interval
 
     if not ray.is_initialized():
@@ -925,6 +905,21 @@ async def train_async_rl(
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     use_distributed = num_training_workers > 1 and distributed_backend != DistributedBackend.NONE
+
+    # For distributed: each GPU gets per_gpu_batch_size, total minibatch = per_gpu * num_workers
+    effective_minibatch_size = (
+        per_gpu_batch_size * num_training_workers if use_distributed else per_gpu_batch_size
+    )
+    ppo_batch_size = config.training.ppo_batch_size or effective_minibatch_size
+
+    # Validate ppo_batch_size >= effective_minibatch_size
+    if ppo_batch_size < effective_minibatch_size:
+        raise ValueError(
+            f"ppo_batch_size ({ppo_batch_size}) must be >= effective minibatch size "
+            f"({effective_minibatch_size} = batch_size {per_gpu_batch_size} × "
+            f"{num_training_workers} workers). "
+            f"Increase ppo_batch_size or decrease batch_size/num_training_workers."
+        )
 
     # Calculate GPU resources
     num_gpus = torch.cuda.device_count()
@@ -990,7 +985,7 @@ async def train_async_rl(
     max_steps = (
         config.training.max_steps
         if config.training.max_steps > 0
-        else len(dataset) // minibatch_size
+        else len(dataset) // effective_minibatch_size
     )
 
     # Get num_prompts_per_dispatch from config or use default
@@ -1005,7 +1000,7 @@ async def train_async_rl(
     dynamic_batcher = DynamicBatcher(
         workers=inference_workers,
         dataset=dataset,
-        minibatch_size=minibatch_size,
+        minibatch_size=effective_minibatch_size,
         max_pending_per_worker=2,
         num_prompts_per_dispatch=num_prompts_per_dispatch,
     )
@@ -1017,6 +1012,9 @@ async def train_async_rl(
 
     if not use_distributed:
         model.train()
+
+    # Buffer for collecting samples when ppo_batch_size > effective_minibatch_size
+    ppo_buffer: list[Sample] = []
 
     try:
         while global_step < max_steps:
@@ -1033,90 +1031,144 @@ async def train_async_rl(
                     break
                 continue
 
-            batch = Minibatch(samples=batch_samples)
+            # Collect samples into PPO buffer
+            ppo_buffer.extend(batch_samples)
 
-            if use_distributed:
-                futures = [
-                    worker.train_step.remote(
-                        batch,
-                        None,
-                        algorithm,
-                        clip_eps,
-                        kl_coef,
-                        config.training.learning_rate,
-                        config.training.weight_decay,
-                    )
-                    for worker in training_workers
-                ]
-                results = await asyncio.gather(*[asyncio.wrap_future(f.future()) for f in futures])
-                metrics = results[0][0]
-            else:
-                loss, metrics = compute_rl_loss(
-                    model=model,
-                    batch=batch,
-                    tokenizer=tokenizer,
-                    device=device,
-                    algorithm=algorithm,
-                    clip_eps=clip_eps,
-                    kl_coef=kl_coef,
-                )
-                scaled_loss = loss / gradient_accumulation_steps
-                scaled_loss.backward()
+            # Wait until we have enough samples for a full PPO batch
+            if len(ppo_buffer) < ppo_batch_size:
+                continue
 
-            for k, v in metrics.items():
-                total_metrics[k] = total_metrics.get(k, 0) + v
+            # Extract ppo_batch_size samples for training
+            training_samples = ppo_buffer[:ppo_batch_size]
+            ppo_buffer = ppo_buffer[ppo_batch_size:]
 
-            grad_accum_count += 1
+            # PPO epochs: iterate over the collected batch multiple times
+            for _epoch in range(ppo_epochs):
+                # Shuffle samples at the start of each epoch for better training
+                shuffled_samples = training_samples.copy()
+                random.shuffle(shuffled_samples)
 
-            if grad_accum_count >= gradient_accumulation_steps:
-                if use_distributed:
-                    futures = [
-                        worker.optimizer_step.remote(config.training.max_grad_norm)
-                        for worker in training_workers
-                    ]
-                    await asyncio.gather(*[asyncio.wrap_future(f.future()) for f in futures])
-                else:
-                    torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), config.training.max_grad_norm
-                    )
-                    optimizer.step()
-                    optimizer.zero_grad()
+                # Process in minibatches (effective_minibatch_size samples per step)
+                for mb_start in range(0, len(shuffled_samples), effective_minibatch_size):
+                    mb_samples = shuffled_samples[mb_start : mb_start + effective_minibatch_size]
+                    if len(mb_samples) < effective_minibatch_size:
+                        # Skip incomplete minibatch at the end
+                        continue
 
-                global_step += 1
-                pbar.update(1)
-                grad_accum_count = 0
-
-                # Update progress bar with combined training + inference metrics
-                inference_metrics = dynamic_batcher.get_inference_metrics()
-                if global_step % config.logging_steps == 0:
-                    avg_metrics = {k: v / config.logging_steps for k, v in total_metrics.items()}
-                    # Combine training and inference metrics
-                    combined_metrics = {**avg_metrics, **inference_metrics}
-                    pbar.set_postfix(combined_metrics)
-                    total_metrics = {}
-                else:
-                    # Still show inference metrics between logging steps
-                    pbar.set_postfix(inference_metrics)
-
-                if config.training.sync_weights and global_step % sync_weights_interval == 0:
                     if use_distributed:
-                        state_dict = await asyncio.wrap_future(
-                            training_workers[0].get_state_dict.remote().future()
+                        # Split samples across workers: each gets per_gpu_batch_size
+                        futures = []
+                        for worker_idx, worker in enumerate(training_workers):
+                            worker_start = worker_idx * per_gpu_batch_size
+                            worker_end = worker_start + per_gpu_batch_size
+                            worker_samples = mb_samples[worker_start:worker_end]
+                            worker_batch = Minibatch(samples=worker_samples)
+                            futures.append(
+                                worker.train_step.remote(
+                                    worker_batch,
+                                    None,
+                                    algorithm,
+                                    clip_eps,
+                                    kl_coef,
+                                    config.training.learning_rate,
+                                    config.training.weight_decay,
+                                    clip_range_ratio,
+                                )
+                            )
+                        results = await asyncio.gather(
+                            *[asyncio.wrap_future(f.future()) for f in futures]
                         )
+                        # Average metrics across workers
+                        metrics = {}
+                        for worker_metrics, _ in results:
+                            for k, v in worker_metrics.items():
+                                metrics[k] = metrics.get(k, 0) + v / len(results)
                     else:
-                        # Use helper to merge LoRA weights if present
-                        state_dict = get_merged_state_dict(model)
-                    for worker in inference_workers:
-                        worker.update_weights.remote(state_dict)
-                    # Increment policy version after weight sync
-                    await dynamic_batcher.increment_policy_version()
+                        batch = Minibatch(samples=mb_samples)
+                        loss, metrics = compute_rl_loss(
+                            model=model,
+                            batch=batch,
+                            tokenizer=tokenizer,
+                            device=device,
+                            algorithm=algorithm,
+                            clip_eps=clip_eps,
+                            kl_coef=kl_coef,
+                            clip_range_ratio=clip_range_ratio,
+                        )
+                        scaled_loss = loss / gradient_accumulation_steps
+                        scaled_loss.backward()
 
-                if global_step % config.save_steps == 0:
-                    checkpoint_path = f"{config.output_dir}/checkpoint-{global_step}"
-                    if not use_distributed:
-                        model.save_pretrained(checkpoint_path)
-                    tokenizer.save_pretrained(checkpoint_path)
-                    logger.info(f"Saved checkpoint to {checkpoint_path}")
+                    for k, v in metrics.items():
+                        total_metrics[k] = total_metrics.get(k, 0) + v
+
+                    grad_accum_count += 1
+
+                    if grad_accum_count >= gradient_accumulation_steps:
+                        if use_distributed:
+                            futures = [
+                                worker.optimizer_step.remote(config.training.max_grad_norm)
+                                for worker in training_workers
+                            ]
+                            await asyncio.gather(
+                                *[asyncio.wrap_future(f.future()) for f in futures]
+                            )
+                        else:
+                            # Compute gradient norm before clipping
+                            grad_norm = torch.nn.utils.clip_grad_norm_(
+                                model.parameters(), config.training.max_grad_norm
+                            )
+                            total_metrics["grad_norm"] = total_metrics.get("grad_norm", 0) + grad_norm.item()
+                            optimizer.step()
+                            optimizer.zero_grad()
+
+                        global_step += 1
+                        pbar.update(1)
+                        grad_accum_count = 0
+
+                        # Update progress bar with combined training + inference metrics
+                        inference_metrics = dynamic_batcher.get_inference_metrics()
+                        if global_step % config.logging_steps == 0:
+                            avg_metrics = {
+                                k: v / config.logging_steps for k, v in total_metrics.items()
+                            }
+                            # Combine training and inference metrics
+                            combined_metrics = {**avg_metrics, **inference_metrics}
+                            pbar.set_postfix(combined_metrics)
+                            total_metrics = {}
+                        else:
+                            # Still show inference metrics between logging steps
+                            pbar.set_postfix(inference_metrics)
+
+                        if (
+                            config.training.sync_weights
+                            and global_step % sync_weights_interval == 0
+                        ):
+                            if use_distributed:
+                                state_dict = await asyncio.wrap_future(
+                                    training_workers[0].get_state_dict.remote().future()
+                                )
+                            else:
+                                # Use helper to merge LoRA weights if present
+                                state_dict = get_merged_state_dict(model)
+                            for worker in inference_workers:
+                                worker.update_weights.remote(state_dict)
+                            # Increment policy version after weight sync
+                            await dynamic_batcher.increment_policy_version()
+
+                        if global_step % config.save_steps == 0:
+                            checkpoint_path = f"{config.output_dir}/checkpoint-{global_step}"
+                            if not use_distributed:
+                                model.save_pretrained(checkpoint_path)
+                            tokenizer.save_pretrained(checkpoint_path)
+                            logger.info(f"Saved checkpoint to {checkpoint_path}")
+
+                        # Check if we've reached max_steps
+                        if global_step >= max_steps:
+                            break
+
+                # Break out of epoch loop if max_steps reached
+                if global_step >= max_steps:
+                    break
 
     finally:
         await dynamic_batcher.stop()

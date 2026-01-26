@@ -15,14 +15,6 @@ class Step(BaseModel):
     )
     content: str = Field(description="The textual content of the step.")
 
-    # Structured Data (Optional)
-    tool_calls: list[dict] | None = Field(
-        default=None, description="Structured tool calls if this is an action step."
-    )
-    tool_call_id: str | None = Field(
-        default=None, description="ID of the tool call this step responds to."
-    )
-
     # Training & RL Metadata
     trainable: bool = Field(
         default=False, description="Whether this step should be trained on (masking)."
@@ -64,10 +56,6 @@ class Trajectory(BaseModel):
     def total_reward(self) -> float:
         """Sum of all rewards in the trajectory."""
         return sum(s.reward for s in self.steps if s.reward is not None)
-
-    def to_sft_format(self, user_role: str = "user", assistant_role: str = "assistant") -> str:
-        """Simple concatenation for SFT (can be customized)."""
-        return "".join(s.content for s in self.steps)
 
     def get_all_token_ids(self) -> list[int]:
         """Flatten token IDs from all steps."""
@@ -190,15 +178,54 @@ class TrainingSample(BaseModel):
     )
 
 
-def save_trajectories(trajectories: list[Trajectory], path: str | Path):
-    """Save a list of trajectories to a JSONL file."""
-    with open(path, "w", encoding="utf-8") as f:
-        for t in trajectories:
-            f.write(t.model_dump_json() + "\n")
+def save_trajectories(
+    trajectories: list[Trajectory],
+    path: str | Path,
+    format: Literal["jsonl", "huggingface"] = "jsonl",
+):
+    """Save trajectories to disk.
+
+    Args:
+        trajectories: List of trajectories to save.
+        path: Output path. For jsonl, a file path. For huggingface, a directory.
+        format: "jsonl" saves as JSONL file, "huggingface" saves as HF dataset.
+    """
+    from datasets import Dataset
+
+    path = Path(path)
+
+    if format == "jsonl":
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            for t in trajectories:
+                f.write(t.model_dump_json() + "\n")
+    else:
+        path.mkdir(parents=True, exist_ok=True)
+        prompts = [
+            [{"role": s.role, "content": s.content} for s in t.steps]
+            for t in trajectories
+        ]
+        ds = Dataset.from_dict({"prompt": prompts})
+        ds.save_to_disk(str(path))
+
+        # Also save trajectories.jsonl for full fidelity
+        with open(path / "trajectories.jsonl", "w", encoding="utf-8") as f:
+            for t in trajectories:
+                f.write(t.model_dump_json() + "\n")
 
 
 def load_trajectories(path: str | Path) -> list[Trajectory]:
-    """Load a list of trajectories from a JSONL file."""
+    """Load trajectories from a JSONL file or HuggingFace dataset directory."""
+    path = Path(path)
+
+    # If path is a directory, look for trajectories.jsonl inside
+    if path.is_dir():
+        jsonl_path = path / "trajectories.jsonl"
+        if jsonl_path.exists():
+            path = jsonl_path
+        else:
+            raise FileNotFoundError(f"No trajectories.jsonl found in {path}")
+
     trajectories = []
     with open(path, encoding="utf-8") as f:
         for line in f:

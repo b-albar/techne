@@ -15,27 +15,12 @@ async def main():
     args = parser.parse_args()
 
     # 1. Load Config
-    config_path = args.config
-    if not os.path.exists(config_path):
-        # Fallback relative check
-        if os.path.exists(f"../{config_path}"):
-            config_path = f"../{config_path}"
-        elif os.path.exists("configs/sft.yaml"):
-            config_path = "configs/sft.yaml"
-
-    config = TechneConfig.from_yaml(config_path)
+    config = TechneConfig.from_yaml(args.config)
 
     # 2. Load Data (ReTool SFT)
     print(f"Loading SFT dataset from {args.dataset}...")
     try:
         data_path = args.dataset
-        if not os.path.exists(data_path):
-            # Fallback relative checks
-            if os.path.exists(f"../{data_path}"):
-                data_path = f"../{data_path}"
-            elif os.path.exists("../data/sft"):
-                data_path = "../data/sft"
-
         ds = load_from_disk(data_path)
         if hasattr(ds, "keys") and "train" in ds:
             train_dataset = ds["train"]

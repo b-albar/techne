@@ -105,7 +105,12 @@ class TrainingConfig(BaseModel):
     num_generations: int = Field(default=4)  # Completions per prompt
     inference_backend: InferenceBackend = Field(default=InferenceBackend.HF)
     clip_eps: float = Field(default=0.2)  # PPO/GRPO clipping epsilon
+    clip_range_ratio: list[float] | None = Field(default=None)  # Manual clip range [min, max]
     kl_coef: float = Field(default=0.1)  # KL penalty coefficient
+    ppo_epochs: int = Field(default=1)  # Number of epochs per batch (reuse same data)
+    ppo_batch_size: int | None = Field(
+        default=None
+    )  # Samples to collect before PPO training (None = use batch_size)
     sync_weights_interval: int = Field(default=10)  # Steps between weight syncs to workers
     # On-policy distillation: separate teacher workers
     num_teacher_workers: int = Field(default=1)  # For DISTILL: workers computing teacher logprobs
@@ -115,6 +120,8 @@ class RolloutConfig(BaseModel):
     max_turns: int = Field(default=5)
     temperature: float = Field(default=0.7)
     top_p: float = Field(default=0.95)
+    top_k: int = Field(default=20)
+    max_new_tokens: int = Field(default=2048)
 
 
 class TechneConfig(BaseModel):

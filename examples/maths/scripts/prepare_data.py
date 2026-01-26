@@ -1,9 +1,14 @@
 """Download and preprocess datasets for math tool-use training."""
 
 import argparse
+import json
+import re
+import shutil
 from pathlib import Path
 
-from datasets import load_dataset, load_from_disk
+from datasets import Dataset, load_dataset, load_from_disk
+
+from techne.data import Step, Trajectory, save_trajectories
 
 
 def download_sft_dataset(output_dir: Path) -> None:
@@ -65,19 +70,34 @@ NEW_INSTR = (
 
 
 def preprocess_sft_data(data_dir: Path) -> None:
-    """Preprocess SFT data to ensure tool_call format matches Agent expectations."""
-    print("Preprocessing SFT dataset...")
-    import json
-    import re
+    """Preprocess SFT data into serialized trajectories with trainability marking.
+
+    Creates Trajectory objects where:
+    - Assistant messages: trainable=True (model learns to generate these)
+    - Tool results/outputs: trainable=False (masked, not trained on)
+    - System/user messages: trainable=False (context only)
+    """
+    print("Preprocessing SFT dataset into trajectories...")
 
     sft_path = data_dir / "sft"
     dataset = load_from_disk(str(sft_path))
 
-    def reformat_and_add_system_prompt(example):
-        messages = example["messages"]
-        new_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    trajectories: list[Trajectory] = []
 
-        for idx, msg in enumerate(messages):
+    for idx, example in enumerate(dataset["train"]):
+        messages = example["messages"]
+        steps: list[Step] = []
+
+        # Add system prompt as first step
+        steps.append(
+            Step(
+                role="system",
+                content=SYSTEM_PROMPT,
+                trainable=False,
+            )
+        )
+
+        for msg in messages:
             role = msg["role"]
             content = msg.get("content") or ""
 
@@ -85,9 +105,8 @@ def preprocess_sft_data(data_dir: Path) -> None:
             if role == "system":
                 continue
 
-            # Clean User Instructions
+            # Clean user instructions
             if role == "user":
-                # Replace broken/legacy instructions - permissive regex
                 content = re.sub(
                     r"Remember to place the final answer in the last part using the format:.*?</answer>",
                     NEW_INSTR,
@@ -95,7 +114,7 @@ def preprocess_sft_data(data_dir: Path) -> None:
                     flags=re.DOTALL,
                 )
 
-            # 1. Standardize Tool Calls (Convert JSON tool_calls to Markdown)
+            # Standardize tool calls (convert JSON tool_calls to markdown)
             if role == "assistant":
                 tool_calls = msg.get("tool_calls")
                 if tool_calls and isinstance(tool_calls, list):
@@ -116,30 +135,14 @@ def preprocess_sft_data(data_dir: Path) -> None:
                             if code:
                                 content = content.rstrip()
                                 content += f"\n```python\n{code}\n```"
-                                # Debug print for extracted tool code
-                                # print(f"Debug: Extracted tool code for message {idx}: {code[:50]}...")
-                            else:
-                                # Debug print for missing tool code
-                                print(
-                                    f"Warning: Tool call found but no code extracted for message {idx}. Args: {args}"
-                                )
 
-                # Heuristic fallback
+                # Heuristic fallback for inline code
                 elif ("import " in content or "print(" in content) and "```" not in content:
                     content = f"```python\n{content}\n```"
 
                 content = content.replace("<code>", "```python\n").replace("</code>", "\n```")
 
-            # 2. Standardize Tool Outputs
-            if role == "tool" or (role == "user" and "output" in content.lower()):
-                if "```" not in content:
-                    content = f"```output\n{content}\n```"
-                content = content.replace("<interpreter>", "```output\n").replace(
-                    "</interpreter>", "\n```"
-                )
-
-            # 3. Standardize Final Answer
-            if role == "assistant":
+                # Standardize final answer format
                 content = content.replace("<answer>", "").replace("</answer>", "")
                 boxed_match = re.search(r"\\boxed\{([^}]+)\}", content)
                 hash_match = re.search(r"####\s*(.*)", content)
@@ -154,45 +157,78 @@ def preprocess_sft_data(data_dir: Path) -> None:
                         hash_match.group(0), f"\n<answer>\n\\boxed{{{ans}}}\n</answer>"
                     )
 
-            new_messages.append({"role": role, "content": content})
+            # Standardize tool outputs
+            is_tool_output = role == "tool" or (role == "user" and "output" in content.lower())
+            if is_tool_output:
+                if "```" not in content:
+                    content = f"```output\n{content}\n```"
+                content = content.replace("<interpreter>", "```output\n").replace(
+                    "</interpreter>", "\n```"
+                )
 
-        return {"prompt": new_messages}
+            # Determine trainability:
+            # - Assistant messages: trainable (model learns to generate)
+            # - Tool outputs: NOT trainable (environment feedback)
+            # - User/system: NOT trainable (context only)
+            if role == "assistant":
+                trainable = True
+                step_role = "assistant"
+            elif is_tool_output:
+                trainable = False
+                step_role = "tool"
+            else:
+                trainable = False
+                step_role = role
 
-    # Apply transformation
-    dataset = dataset.map(
-        reformat_and_add_system_prompt, remove_columns=["messages"], load_from_cache_file=False
-    )
+            steps.append(
+                Step(
+                    role=step_role,
+                    content=content,
+                    trainable=trainable,
+                )
+            )
 
-    # Save back (using temp path to avoid self-overwrite)
+        trajectory = Trajectory(
+            steps=steps,
+            metadata={"source": "ReTool-SFT-multi-turn", "example_idx": idx},
+        )
+        trajectories.append(trajectory)
+
+    # Save trajectories as JSONL
+    output_path = sft_path / "trajectories.jsonl"
+    save_trajectories(trajectories, output_path)
+
+    # Also save as HuggingFace dataset with prompt column for backwards compatibility
+    def trajectory_to_prompt(traj: Trajectory) -> list[dict]:
+        return [{"role": s.role, "content": s.content} for s in traj.steps]
+
+    prompt_data = [{"prompt": trajectory_to_prompt(t)} for t in trajectories]
+    hf_dataset = Dataset.from_list(prompt_data)
+
+    # Save HF dataset (overwrite original)
     temp_path = sft_path.with_name("sft_temp")
-    dataset.save_to_disk(str(temp_path))
+    hf_dataset.save_to_disk(str(temp_path))
 
-    import shutil
+    # Move files
+    for f in sft_path.iterdir():
+        if f.name != "trajectories.jsonl":
+            if f.is_dir():
+                shutil.rmtree(f)
+            else:
+                f.unlink()
 
-    if sft_path.exists():
-        shutil.rmtree(sft_path)
-    shutil.move(str(temp_path), str(sft_path))
+    for f in temp_path.iterdir():
+        shutil.move(str(f), str(sft_path / f.name))
+    temp_path.rmdir()
 
-    sample = dataset["train"][0]
-    print(f"✓ Processed sample messages: {len(sample.get('prompt', []))}")
-    print(f"✓ Sample content end: {str(sample['prompt'][-1]['content'])[-50:]}")
+    print(f"✓ Created {len(trajectories)} trajectories")
+    print(f"✓ Saved to {output_path}")
 
-
-SYSTEM_PROMPT = (
-    "You are a helpful assistant capable of solving math problems.\n"
-    "You can use a Python interpreter to calculate results.\n"
-    "To execute Python code, wrap it in a markdown block:\n"
-    "```python\n"
-    "print(12 * 12)\n"
-    "```\n"
-    "The output will be provided to you in a ```output block.\n"
-    "The last line of your response should be of the form:\n"
-    "<answer>\n"
-    "\\\\boxed{Answer}\n"
-    "</answer>\n"
-    "where Answer is the answer to the problem.\n"
-    "Solve the following problem:\n"
-)
+    # Print sample statistics
+    sample = trajectories[0]
+    trainable_steps = sum(1 for s in sample.steps if s.trainable)
+    total_steps = len(sample.steps)
+    print(f"✓ Sample: {trainable_steps}/{total_steps} steps trainable")
 
 
 def preprocess_rl_data(data_dir: Path) -> None:
@@ -226,8 +262,6 @@ def preprocess_rl_data(data_dir: Path) -> None:
     # Save to temp and move because datasets can't overwrite itself
     temp_path = rl_path.with_name("rl_temp")
     dataset.save_to_disk(str(temp_path))
-
-    import shutil
 
     if rl_path.exists():
         shutil.rmtree(rl_path)
@@ -280,8 +314,6 @@ def preprocess_eval_data(data_dir: Path) -> None:
     # Save to temp and move
     temp_path = eval_path.with_name("eval_temp")
     dataset.save_to_disk(str(temp_path))
-
-    import shutil
 
     if eval_path.exists():
         shutil.rmtree(eval_path)

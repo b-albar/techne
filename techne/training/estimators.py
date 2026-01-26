@@ -1,8 +1,8 @@
-import torch
-import torch.nn.functional as F
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Union, Optional
+
+import torch
+import torch.nn.functional as F
 
 
 @dataclass
@@ -25,7 +25,7 @@ class DistillationEstimator(ABC):
     def compute_loss(
         self,
         student_logits: torch.Tensor,
-        teacher_data: Union[torch.Tensor, SparseLogits],
+        teacher_data: torch.Tensor | SparseLogits,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -88,8 +88,7 @@ class SlimEstimator(DistillationEstimator):
 
     def compute_loss(self, student_logits, teacher_data, **kwargs):
         if not isinstance(teacher_data, SparseLogits):
-            # Fallback to dense if provided?
-            return ForwardKLEstimator(self.temperature).compute_loss(student_logits, teacher_data)
+            raise TypeError("SlimEstimator requires SparseLogits. Use ForwardKLEstimator for dense logits.")
 
         # Unpack sparse
         indices = teacher_data.indices  # [B, S, K]

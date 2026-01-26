@@ -16,15 +16,7 @@ async def main():
     args = parser.parse_args()
 
     # 1. Load Config
-    config_path = args.config
-    if not os.path.exists(config_path):
-        # Only simple relative check
-        if os.path.exists(f"../{config_path}"):
-            config_path = f"../{config_path}"
-        else:
-            raise FileNotFoundError(f"Config file not found: {args.config}")
-
-    config = TechneConfig.from_yaml(config_path)
+    config = TechneConfig.from_yaml(args.config)
 
     # 2. Load Real Data (DAPO-Math-17k for ReTool)
     print(f"Loading RL dataset from {args.dataset}...")
@@ -32,12 +24,6 @@ async def main():
 
     try:
         data_path = args.dataset
-        if not os.path.exists(data_path):
-            if os.path.exists(f"../{data_path}"):
-                data_path = f"../{data_path}"
-            elif os.path.exists("../data/rl"):
-                data_path = "../data/rl"
-
         ds = load_from_disk(data_path)
     except Exception as e:
         print(f"Error loading dataset: {e}")
