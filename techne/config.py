@@ -298,6 +298,7 @@ class TechneConfig(BaseModel):
 
     # Agent settings
     max_turns: int = 5
+    max_new_tokens: int = 2048
 
     # Output
     output_dir: str = "./output"
@@ -317,8 +318,10 @@ class TechneConfig(BaseModel):
         Returns training.inference if set, otherwise derives from model config.
         """
         if self.training.inference is not None:
-            return self.training.inference
-        return self.model.to_inference_config(device=device)
+            config = self.training.inference
+            config.max_new_tokens = self.max_new_tokens
+            return config
+        return self.model.to_inference_config(device=device, max_new_tokens=self.max_new_tokens)
 
     def get_teacher_config(self) -> InferenceConfig | None:
         """Get teacher model config for distillation."""

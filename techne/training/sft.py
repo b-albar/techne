@@ -1,13 +1,16 @@
 """SFT/DFT training utilities."""
 
+import logging
 from typing import Any
 
 import torch
-from datasets import Dataset
+from datasets import Dataset, Features, Sequence, Value
 from trl import SFTConfig, SFTTrainer
 
 from techne.config import TechneConfig, TrainingAlgorithm
 from techne.data import TrainingSample, Trajectory
+
+logger = logging.getLogger(__name__)
 
 
 def get_sft_trainer(
@@ -46,19 +49,41 @@ def get_sft_trainer(
     train_dataset = samples
 
     # Convert typed objects to dicts for SFTTrainer
+    # Explicit features to ensure input_ids/labels are integers (not floats)
+    int_features = Features({
+        "input_ids": Sequence(Value("int64")),
+        "labels": Sequence(Value("int64")),
+    })
+
+    max_len = config.training.max_seq_length
+
     if isinstance(samples, list) and len(samples) > 0:
         first = samples[0]
         if isinstance(first, Trajectory):
             data_list = []
             for traj in samples:
                 sample = traj.to_training_sample(tokenizer=tokenizer)
-                data_list.append({"input_ids": sample.input_ids, "labels": sample.labels})
-            train_dataset = Dataset.from_list(data_list)
+                if len(sample.input_ids) <= max_len:
+                    data_list.append({"input_ids": sample.input_ids, "labels": sample.labels})
+            filtered = len(samples) - len(data_list)
+            if filtered > 0:
+                logger.info(f"Filtered {filtered}/{len(samples)} samples exceeding max_seq_length={max_len}")
+            train_dataset = Dataset.from_list(data_list, features=int_features)
         elif isinstance(first, TrainingSample):
-            data_list = [{"input_ids": s.input_ids, "labels": s.labels} for s in samples]
-            train_dataset = Dataset.from_list(data_list)
+            data_list = [
+                {"input_ids": s.input_ids, "labels": s.labels}
+                for s in samples if len(s.input_ids) <= max_len
+            ]
+            filtered = len(samples) - len(data_list)
+            if filtered > 0:
+                logger.info(f"Filtered {filtered}/{len(samples)} samples exceeding max_seq_length={max_len}")
+            train_dataset = Dataset.from_list(data_list, features=int_features)
         elif isinstance(first, dict):
-            train_dataset = Dataset.from_list(samples)
+            data_list = [s for s in samples if len(s.get("input_ids", [])) <= max_len]
+            filtered = len(samples) - len(data_list)
+            if filtered > 0:
+                logger.info(f"Filtered {filtered}/{len(samples)} samples exceeding max_seq_length={max_len}")
+            train_dataset = Dataset.from_list(data_list, features=int_features)
         else:
             raise TypeError(f"Unsupported sample type: {type(first)}")
 
