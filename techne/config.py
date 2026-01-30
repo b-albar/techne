@@ -48,6 +48,7 @@ class TrainingAlgorithm(str, Enum):
     DISTILL = "distill"
 
     # Off-policy / Offline
+    SPO = "spo"
     OFFLINE_RL = "offline_rl"
     DISTILL_OFFLINE = "distill_offline"
     SFT = "sft"
@@ -283,6 +284,9 @@ class TrainingConfig(BaseModel):
     ppo_batch_size: int | None = None
     sync_weights: bool = True
     sync_weights_interval: int = 10
+
+    # SPO (Soft Policy Optimization)
+    spo_beta: float = 0.087  # Temperature ≈ 1/log(100000)
 
     @model_validator(mode="after")
     def _validate_hybrid_parallelism(self):

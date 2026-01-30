@@ -107,6 +107,14 @@ class TechneTrainer:
                 self.config, self.model, self.tokenizer, data, **kwargs
             )
 
+        # 2b. SPO (Soft Policy Optimization) — offline off-policy RL
+        if algo == TrainingAlgorithm.SPO:
+            from techne.training.offline_rl import train_spo
+
+            return train_spo(
+                self.config, self.model, self.tokenizer, data, **kwargs
+            )
+
         # 3. Offline Training (SFT/DFT)
         if not data:
             if is_main_process():

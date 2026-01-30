@@ -1,0 +1,42 @@
+# SPO (Soft Policy Optimization) Training Configuration
+# Off-policy RL that trains on pre-collected trajectories with rewards.
+# Reference: https://arxiv.org/abs/2503.05453
+
+model:
+  name_or_path: "Qwen/Qwen3-0.6B"
+  dtype: "bfloat16"
+  attn_implementation: "sdpa"
+  trust_remote_code: true
+  lora:
+    enabled: true
+    r: 16
+    alpha: 32
+    dropout: 0.05
+    target_modules:
+      - q_proj
+      - v_proj
+
+training:
+  algorithm: "spo"
+  learning_rate: 6e-8
+  batch_size: 2
+  gradient_accumulation_steps: 16
+  max_seq_length: 2048
+  num_train_epochs: 3
+  warmup_steps: 200
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  report_to: "none"
+
+  # SPO hyperparameters
+  spo_beta: 0.087  # Temperature ~ 1/log(100000)
+
+  # Distributed training (disabled by default)
+  distributed_backend: "none"  # "fsdp" for multi-GPU data parallelism, "tp" for tensor parallelism
+  # num_training_workers: 4          # number of DP workers (FSDP)
+  # tensor_parallel_size: 1          # GPUs per worker for hybrid TP+DP (requires FSDP)
+
+output_dir: "./output/spo"
+seed: 42
+logging_steps: 10
+save_steps: 100
