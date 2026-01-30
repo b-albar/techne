@@ -27,6 +27,7 @@ os.environ.setdefault("RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO", "0")
 os.environ.setdefault("RAY_DEDUP_LOGS", "0")
 os.environ.setdefault("RAY_ENABLE_RECORD_ACTOR_TASK_LOGGING", "0")
 os.environ.setdefault("RAY_metrics_report_interval_ms", "0")
+os.environ.setdefault("RAY_ENABLE_METRICS_COLLECTION", "0")
 
 import ray  # noqa: E402
 import torch  # noqa: E402
@@ -1123,7 +1124,10 @@ async def train_async_rl(
             _metrics_export_port=None,
             configure_logging=False,
             log_to_driver=False,
-            _system_config={"metrics_report_interval_ms": 0},
+            _system_config={
+                "metrics_report_interval_ms": 0,
+                "enable_metrics_collection": False,
+            },
         )
 
     from techne.training.distributed import detect_device
