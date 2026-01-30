@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import random
 import time
@@ -32,11 +33,98 @@ import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402, N812
 from tqdm.auto import tqdm  # noqa: E402
 
-from techne.config import DistributedBackend, InferenceConfig, TechneConfig  # noqa: E402
+from techne.config import (  # noqa: E402
+    DistributedBackend,
+    InferenceConfig,
+    OptimizerType,
+    SchedulerType,
+    TechneConfig,
+    TrainingConfig,
+)
 from techne.training.model import InferenceModel  # noqa: E402
 
 # Type alias for model factories
 ModelFactory = Callable[[], InferenceModel]
+
+
+def create_optimizer(
+    params,
+    training_config: TrainingConfig,
+) -> torch.optim.Optimizer:
+    """Create optimizer from config."""
+    lr = training_config.learning_rate
+    wd = training_config.weight_decay
+    extra = training_config.optimizer_kwargs
+
+    if training_config.optimizer == OptimizerType.ADAMW:
+        betas = (extra.get("beta1", 0.9), extra.get("beta2", 0.999))
+        eps = extra.get("eps", 1e-8)
+        return torch.optim.AdamW(params, lr=lr, weight_decay=wd, betas=betas, eps=eps)
+    elif training_config.optimizer == OptimizerType.ADAM:
+        betas = (extra.get("beta1", 0.9), extra.get("beta2", 0.999))
+        eps = extra.get("eps", 1e-8)
+        return torch.optim.Adam(params, lr=lr, weight_decay=wd, betas=betas, eps=eps)
+    elif training_config.optimizer == OptimizerType.SGD:
+        momentum = extra.get("momentum", 0.0)
+        return torch.optim.SGD(params, lr=lr, weight_decay=wd, momentum=momentum)
+    elif training_config.optimizer == OptimizerType.ADAFACTOR:
+        try:
+            from transformers.optimization import Adafactor
+
+            return Adafactor(
+                params,
+                lr=lr,
+                weight_decay=wd,
+                scale_parameter=extra.get("scale_parameter", False),
+                relative_step=extra.get("relative_step", False),
+            )
+        except ImportError:
+            raise ImportError("Adafactor requires the `transformers` package.")
+    else:
+        raise ValueError(f"Unknown optimizer: {training_config.optimizer}")
+
+
+def create_scheduler(
+    optimizer: torch.optim.Optimizer,
+    training_config: TrainingConfig,
+    max_steps: int,
+) -> torch.optim.lr_scheduler.LRScheduler:
+    """Create LR scheduler from config."""
+    warmup_steps = int(max_steps * training_config.warmup_ratio)
+
+    if training_config.scheduler == SchedulerType.COSINE:
+
+        def cosine_with_warmup(current_step: int) -> float:
+            if current_step < warmup_steps:
+                return current_step / max(1, warmup_steps)
+            progress = (current_step - warmup_steps) / max(1, max_steps - warmup_steps)
+            return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, cosine_with_warmup)
+
+    elif training_config.scheduler == SchedulerType.LINEAR:
+
+        def linear_with_warmup(current_step: int) -> float:
+            if current_step < warmup_steps:
+                return current_step / max(1, warmup_steps)
+            return max(0.0, 1.0 - (current_step - warmup_steps) / max(1, max_steps - warmup_steps))
+
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, linear_with_warmup)
+
+    elif training_config.scheduler == SchedulerType.CONSTANT_WITH_WARMUP:
+
+        def constant_with_warmup(current_step: int) -> float:
+            if current_step < warmup_steps:
+                return current_step / max(1, warmup_steps)
+            return 1.0
+
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, constant_with_warmup)
+
+    elif training_config.scheduler == SchedulerType.CONSTANT:
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+
+    else:
+        raise ValueError(f"Unknown scheduler: {training_config.scheduler}")
 
 
 def get_merged_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
@@ -78,6 +166,7 @@ class Sample:
     prompt_ids: list[int]
     completion_ids: list[int]
     ref_logprobs: list[float]
+    old_logprobs: list[float] | None = None  # Policy logprobs at generation time (for ratio)
     reward: float = 0.0
     advantage: float = 0.0
     policy_version: int = 0  # For staleness tracking
@@ -252,7 +341,12 @@ class InferenceWorker:
                             completion_ids.extend(step.token_ids)
                             completion_text += step.content
 
-                    ref_logprobs = self.model.compute_logprobs(prompt_ids, completion_ids)
+                    # Compute both reference and current policy logprobs
+                    # ref_logprobs: from reference/initial model (for KL penalty)
+                    # old_logprobs: from current policy at generation time (for ratio)
+                    logprobs = self.model.compute_logprobs(prompt_ids, completion_ids)
+                    ref_logprobs = logprobs
+                    old_logprobs = logprobs  # Same model at generation time
 
                     reward = 0.0
                     if self.reward_fn:
@@ -268,6 +362,7 @@ class InferenceWorker:
                             prompt_ids=prompt_ids,
                             completion_ids=completion_ids,
                             ref_logprobs=ref_logprobs,
+                            old_logprobs=old_logprobs,
                             reward=reward,
                         )
                     )
@@ -287,7 +382,10 @@ class InferenceWorker:
                 for seq in outputs.sequences:
                     completion_ids = seq[len(prompt_ids) :].tolist()
                     completion = self.tokenizer.decode(completion_ids, skip_special_tokens=True)
-                    ref_logprobs = self.model.compute_logprobs(prompt_ids, completion_ids)
+                    # Compute both reference and current policy logprobs
+                    logprobs = self.model.compute_logprobs(prompt_ids, completion_ids)
+                    ref_logprobs = logprobs
+                    old_logprobs = logprobs  # Same model at generation time
 
                     reward = 0.0
                     if self.reward_fn:
@@ -303,6 +401,7 @@ class InferenceWorker:
                             prompt_ids=prompt_ids,
                             completion_ids=completion_ids,
                             ref_logprobs=ref_logprobs,
+                            old_logprobs=old_logprobs,
                             reward=reward,
                         )
                     )
@@ -331,12 +430,14 @@ class TrainingWorker:
         rank: int,
         world_size: int,
         distributed_backend: DistributedBackend = DistributedBackend.NONE,
+        training_config: TrainingConfig | None = None,
     ):
         import os
 
         self.rank = rank
         self.world_size = world_size
         self.distributed_backend = distributed_backend
+        self.training_config = training_config
 
         if distributed_backend == DistributedBackend.FSDP:
             os.environ["RANK"] = str(rank)
@@ -386,13 +487,16 @@ class TrainingWorker:
         clip_range_ratio: list[float] | None = None,
     ) -> tuple[dict, dict]:
         """Execute a training step and return metrics + new optimizer state."""
-        if optimizer_state is None:
-            self.optimizer = torch.optim.AdamW(
-                self.model.parameters(),
-                lr=lr,
-                weight_decay=weight_decay,
-            )
-        else:
+        if not hasattr(self, "optimizer"):
+            if self.training_config is not None:
+                self.optimizer = create_optimizer(self.model.parameters(), self.training_config)
+            else:
+                self.optimizer = torch.optim.AdamW(
+                    self.model.parameters(),
+                    lr=lr,
+                    weight_decay=weight_decay,
+                )
+        elif optimizer_state is not None:
             self.optimizer.load_state_dict(optimizer_state)
 
         self.model.train()
@@ -644,12 +748,16 @@ class DynamicBatcher:
                 stale_count = len(batch) - len(fresh_samples)
                 if stale_count > 0:
                     self.stats["samples_dropped_stale"] += stale_count
-                    # Re-push fresh samples if not enough for a batch
+                    # Re-push fresh samples as a group if not enough for a batch
                     if len(fresh_samples) < self.minibatch_size:
-                        for s in fresh_samples:
-                            await self.cache.push_one(s)
+                        if fresh_samples:
+                            await self.cache.push(fresh_samples)
                         continue
                     batch = fresh_samples[: self.minibatch_size]
+                    # Re-push any excess fresh samples as a group
+                    excess = fresh_samples[self.minibatch_size :]
+                    if excess:
+                        await self.cache.push(excess)
 
             # Skip zero-gradient batches (Open-Instruct active sampling filter)
             if skip_zero_gradient and should_skip_batch(batch):
@@ -795,7 +903,6 @@ def compute_rl_loss(
 
     all_input_ids = []
     all_labels = []
-    all_ref_logprobs = []
     all_advantages = []
 
     for s in batch.samples:
@@ -808,7 +915,6 @@ def compute_rl_loss(
 
         all_input_ids.append(input_ids)
         all_labels.append(labels)
-        all_ref_logprobs.append(s.ref_logprobs)
         all_advantages.append(s.advantage)
 
     input_ids = torch.tensor(all_input_ids, device=device)
@@ -829,61 +935,59 @@ def compute_rl_loss(
 
     mask = shift_labels != -100
 
-    # Reference logprobs tensor
+    # Build old policy logprobs tensor (for ratio / trust region)
+    # and reference logprobs tensor (for KL penalty)
+    old_logprobs_tensor = torch.zeros_like(policy_logprobs)
     ref_logprobs_tensor = torch.zeros_like(policy_logprobs)
     for i, s in enumerate(batch.samples):
         start = len(s.prompt_ids) - 1
-        end = start + len(s.ref_logprobs)
-        if end <= seq_len and len(s.ref_logprobs) > 0:
+        n_completion = len(s.ref_logprobs)
+        end = start + n_completion
+        if end <= seq_len and n_completion > 0:
             ref_logprobs_tensor[i, start:end] = torch.tensor(
                 s.ref_logprobs, device=device, dtype=torch.float32
             )
+            # Use old_logprobs for ratio if available, else fall back to ref_logprobs
+            old_lp = s.old_logprobs if s.old_logprobs is not None else s.ref_logprobs
+            old_logprobs_tensor[i, start:end] = torch.tensor(
+                old_lp, device=device, dtype=torch.float32
+            )
 
-    # Compute ratio
-    ratio = torch.exp(policy_logprobs - ref_logprobs_tensor)
+    # Compute ratio: π_θ / π_old (current policy vs. policy at generation time)
+    ratio = torch.exp(policy_logprobs - old_logprobs_tensor)
 
     # Algorithm-specific loss
-    if algorithm == "ppo":
-        # PPO: clip ratio, multiply by advantage
-        if clip_range_ratio is not None:
-            clipped_ratio = torch.clamp(ratio, clip_range_ratio[0], clip_range_ratio[1])
-        else:
-            clipped_ratio = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps)
+    adv_expanded = advantages.unsqueeze(1).expand(-1, seq_len)
 
-        adv_expanded = advantages.unsqueeze(1).expand(-1, seq_len)
-        loss1 = -adv_expanded * ratio
-        loss2 = -adv_expanded * clipped_ratio
-        policy_loss = torch.max(loss1, loss2)
-
-    elif algorithm == "gspo":
+    if algorithm == "gspo":
         # GSPO: soft clipping with tanh
-        adv_expanded = advantages.unsqueeze(1).expand(-1, seq_len)
-        log_ratio = policy_logprobs - ref_logprobs_tensor
+        log_ratio = policy_logprobs - old_logprobs_tensor
         soft_clip = torch.tanh(log_ratio / clip_eps) * clip_eps
         policy_loss = -adv_expanded * soft_clip
-
-    else:  # grpo (default)
-        # GRPO: standard PPO-style clipping
+    else:
+        # PPO / GRPO: standard PPO-style clipping
         if clip_range_ratio is not None:
             clipped_ratio = torch.clamp(ratio, clip_range_ratio[0], clip_range_ratio[1])
         else:
             clipped_ratio = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps)
-        adv_expanded = advantages.unsqueeze(1).expand(-1, seq_len)
         loss1 = -adv_expanded * ratio
         loss2 = -adv_expanded * clipped_ratio
         policy_loss = torch.max(loss1, loss2)
 
-    # KL penalty
+    # KL penalty against reference model (NOT old policy)
     kl = policy_logprobs - ref_logprobs_tensor
     total_loss = policy_loss + kl_coef * kl
 
-    # Masked mean
-    masked_loss = (total_loss * mask).sum() / mask.sum().clamp(min=1)
+    # Per-sample masked mean, then average across samples
+    # Each sample gets equal weight regardless of completion length
+    per_sample_loss = (total_loss * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+    masked_loss = per_sample_loss.mean()
 
     # Compute entropy of policy distribution (measures exploration)
     probs = F.softmax(logits[:, :-1, :], dim=-1)
     entropy = -(probs * log_probs[:, :-1, :]).sum(dim=-1)  # [B, S]
-    masked_entropy = (entropy * mask).sum() / mask.sum().clamp(min=1)
+    per_sample_entropy = (entropy * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+    masked_entropy = per_sample_entropy.mean()
 
     # Compute clipping statistics
     if algorithm in ("ppo", "grpo"):
@@ -896,15 +1000,20 @@ def compute_rl_loss(
     response_lengths = [len(s.completion_ids) for s in batch.samples]
     mean_response_len = sum(response_lengths) / len(response_lengths)
 
+    # Per-sample metrics for consistency
+    per_sample_policy_loss = (policy_loss * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+    per_sample_kl = (kl * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+    per_sample_ratio = (ratio * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+
     metrics = {
         "loss": masked_loss.item(),
-        "policy_loss": (policy_loss * mask).sum().item() / mask.sum().clamp(min=1).item(),
-        "kl": (kl * mask).sum().item() / mask.sum().clamp(min=1).item(),
+        "policy_loss": per_sample_policy_loss.mean().item(),
+        "kl": per_sample_kl.mean().item(),
         "entropy": masked_entropy.item(),
         "mean_advantage": advantages.mean().item(),
         "mean_reward": sum(s.reward for s in batch.samples) / len(batch.samples),
         "response_len": mean_response_len,
-        "ratio_mean": (ratio * mask).sum().item() / mask.sum().clamp(min=1).item(),
+        "ratio_mean": per_sample_ratio.mean().item(),
         "clip_frac": clip_fraction,
     }
 
@@ -1028,6 +1137,7 @@ async def train_async_rl(
                 rank=i,
                 world_size=num_training_workers,
                 distributed_backend=distributed_backend,
+                training_config=config.training,
             )
             for i in range(num_training_workers)
         ]
@@ -1035,11 +1145,7 @@ async def train_async_rl(
             f"Distributed training: {num_training_workers} workers with {distributed_backend.value.upper()}"
         )
     else:
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=config.training.learning_rate,
-            weight_decay=config.training.weight_decay,
-        )
+        optimizer = create_optimizer(model.parameters(), config.training)
 
     global_step = 0
     grad_accum_count = 0
@@ -1049,6 +1155,10 @@ async def train_async_rl(
         if config.training.max_steps > 0
         else len(dataset) // effective_minibatch_size
     )
+
+    # Learning rate scheduler
+    if not use_distributed:
+        scheduler = create_scheduler(optimizer, config.training, max_steps)
 
     # Get num_prompts_per_dispatch from config or use default
     num_prompts_per_dispatch = getattr(config.training, "num_prompts_per_dispatch", 1)
@@ -1185,6 +1295,7 @@ async def train_async_rl(
                             )
                             total_metrics["grad_norm"] = total_metrics.get("grad_norm", 0) + grad_norm.item()
                             optimizer.step()
+                            scheduler.step()
                             optimizer.zero_grad()
 
                         global_step += 1
@@ -1202,6 +1313,9 @@ async def train_async_rl(
                             avg_metrics = {
                                 k: v / config.logging_steps for k, v in total_metrics.items()
                             }
+                            # Add current learning rate
+                            if not use_distributed:
+                                avg_metrics["lr"] = scheduler.get_last_lr()[0]
                             # Combine training and inference metrics
                             combined_metrics = {**avg_metrics, **inference_metrics}
                             pbar.set_postfix(combined_metrics)

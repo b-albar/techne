@@ -79,6 +79,24 @@ class DistributedBackend(str, Enum):
     DDP = "ddp"
 
 
+class OptimizerType(str, Enum):
+    """Optimizer algorithm."""
+
+    ADAMW = "adamw"
+    ADAM = "adam"
+    SGD = "sgd"
+    ADAFACTOR = "adafactor"
+
+
+class SchedulerType(str, Enum):
+    """Learning rate scheduler."""
+
+    COSINE = "cosine"
+    LINEAR = "linear"
+    CONSTANT = "constant"
+    CONSTANT_WITH_WARMUP = "constant_with_warmup"
+
+
 # =============================================================================
 # Model Configuration
 # =============================================================================
@@ -224,6 +242,9 @@ class TrainingConfig(BaseModel):
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
     warmup_ratio: float = 0.1
+    optimizer: OptimizerType = OptimizerType.ADAMW
+    optimizer_kwargs: dict[str, Any] = Field(default_factory=dict)
+    scheduler: SchedulerType = SchedulerType.COSINE
 
     # Batching
     batch_size: int = 8
