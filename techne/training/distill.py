@@ -402,19 +402,21 @@ class _DistillationTrainer(SFTTrainer):
                 else:
                     teacher_data = t_logits
 
-                # Build mask
+                # Build mask: logits at position t predict token t+1, so
+                # we mask based on whether position t+1 is a valid target.
+                # Use shifted labels/ids (positions 1..min_len) to decide
+                # which logit positions (0..min_len-1) to include.
                 pad_id = self.student_tokenizer.pad_token_id
                 if pad_id is not None:
-                    mask = (inputs["input_ids"][:, :min_len] != pad_id).float()
+                    mask = (inputs["input_ids"][:, 1 : min_len + 1] != pad_id).float()
                 else:
                     mask = torch.ones(
-                        inputs["input_ids"][:, :min_len].shape, device=s_logits.device
+                        s_logits.shape[:2], device=s_logits.device
                     )
 
                 if "labels" in inputs:
-                    labels = inputs["labels"][:, :min_len]
-                    valid_label_mask = (labels != -100).float()
-                    mask = mask * valid_label_mask
+                    shift_labels = inputs["labels"][:, 1 : min_len + 1]
+                    mask = mask * (shift_labels != -100).float()
 
                 return self.estimator.compute_loss(s_logits, teacher_data, mask=mask)
 
