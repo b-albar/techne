@@ -253,6 +253,7 @@ class InferenceWorker:
         model_factory: ModelFactory,
         num_generations: int = 4,
         max_new_tokens: int = 512,
+        max_seq_length: int | None = None,
         temperature: float = 0.7,
         agent_class: Any | None = None,
         agent_config: TechneConfig | None = None,
@@ -260,6 +261,7 @@ class InferenceWorker:
     ):
         self.num_generations = num_generations
         self.max_new_tokens = max_new_tokens
+        self.max_seq_length = max_seq_length
         self.temperature = temperature
         self.agent_class = agent_class
         self.agent_config = agent_config
@@ -286,6 +288,7 @@ class InferenceWorker:
             "total_reward": 0.0,
             "positive_rewards": 0,
             "generation_time": 0.0,
+            "filtered_long": 0,
         }
         self._start_time = time.time()
 
@@ -341,6 +344,11 @@ class InferenceWorker:
                             completion_ids.extend(step.token_ids)
                             completion_text += step.content
 
+                    # Drop sequences exceeding max_seq_length
+                    if self.max_seq_length is not None and len(prompt_ids) + len(completion_ids) > self.max_seq_length:
+                        self._metrics["filtered_long"] += 1
+                        continue
+
                     # Compute both reference and current policy logprobs
                     # ref_logprobs: from reference/initial model (for KL penalty)
                     # old_logprobs: from current policy at generation time (for ratio)
@@ -381,6 +389,12 @@ class InferenceWorker:
 
                 for seq in outputs.sequences:
                     completion_ids = seq[len(prompt_ids) :].tolist()
+
+                    # Drop sequences exceeding max_seq_length
+                    if self.max_seq_length is not None and len(prompt_ids) + len(completion_ids) > self.max_seq_length:
+                        self._metrics["filtered_long"] += 1
+                        continue
+
                     completion = self.tokenizer.decode(completion_ids, skip_special_tokens=True)
                     # Compute both reference and current policy logprobs
                     logprobs = self.model.compute_logprobs(prompt_ids, completion_ids)
@@ -840,6 +854,7 @@ class DynamicBatcher:
             total_reward = 0.0
             positive_rewards = 0
             total_gen_time = 0.0
+            total_filtered_long = 0
 
             for m in metrics_list:
                 if isinstance(m, dict):
@@ -848,6 +863,7 @@ class DynamicBatcher:
                     total_reward += m.get("total_reward", 0.0)
                     positive_rewards += m.get("positive_rewards", 0)
                     total_gen_time += m.get("generation_time", 0.0)
+                    total_filtered_long += m.get("filtered_long", 0)
 
             return {
                 "prompts": total_prompts,
@@ -855,6 +871,7 @@ class DynamicBatcher:
                 "reward": total_reward,
                 "pos_rewards": positive_rewards,
                 "gen_time": total_gen_time,
+                "filtered_long": total_filtered_long,
             }
         except Exception:
             return {}
@@ -893,8 +910,11 @@ class DynamicBatcher:
         if worker_metrics:
             trajs = worker_metrics.get("trajs", 0)
             pos = worker_metrics.get("pos_rewards", 0)
+            filtered_long = worker_metrics.get("filtered_long", 0)
             metrics["trajs"] = trajs
             metrics["reward%"] = round(100 * pos / trajs, 1) if trajs > 0 else 0.0
+            if filtered_long > 0:
+                metrics["dropped"] = filtered_long
 
         return metrics
 
@@ -1162,6 +1182,7 @@ async def train_async_rl(
             model_factory=inference_config.create_model_factory(for_training=False),
             num_generations=num_generations,
             max_new_tokens=inference_config.max_new_tokens,
+            max_seq_length=config.training.max_seq_length,
             temperature=inference_config.temperature,
             agent_class=agent_class,
             agent_config=config,

@@ -131,11 +131,16 @@ def train_distill_offline(
     # 2. Prepare for Distillation (KL Loss)
     if is_main_process():
         logger.info("Preparing distillation dataset from Trajectories...")
+    max_len = config.training.max_seq_length
     processed_samples = []
     samples_with_logprobs = 0
+    filtered = 0
 
     for traj in trajectories:
         sample = traj.to_training_sample(tokenizer=tokenizer)
+        if max_len is not None and len(sample.input_ids) > max_len:
+            filtered += 1
+            continue
         sample_dict = {"input_ids": sample.input_ids, "labels": sample.labels}
 
         if sample.log_probs is not None:
@@ -143,6 +148,12 @@ def train_distill_offline(
             samples_with_logprobs += 1
 
         processed_samples.append(sample_dict)
+
+    if filtered > 0 and is_main_process():
+        logger.info(
+            "Filtered %d/%d trajectories exceeding max_seq_length=%d",
+            filtered, len(trajectories), max_len,
+        )
 
     dataset = processed_samples
     all_have_logprobs = samples_with_logprobs == len(processed_samples)

@@ -249,7 +249,7 @@ class TrainingConfig(BaseModel):
     # Batching
     batch_size: int = 8
     gradient_accumulation_steps: int = 4
-    max_seq_length: int = 4096
+    max_seq_length: int | None = None
 
     # Schedule
     max_steps: int = -1
@@ -320,6 +320,12 @@ class TechneConfig(BaseModel):
         training:
           algorithm: sft
           learning_rate: 1e-5
+
+          # Distributed (all optional, defaults to single-GPU)
+          distributed_backend: none   # fsdp | tp | none
+          # num_training_workers: 4   # DP workers (FSDP)
+          # tensor_parallel_size: 4   # GPUs per worker (hybrid TP+DP)
+
           inference:
             name_or_path: Qwen/Qwen3-0.6B
             temperature: 0.7
