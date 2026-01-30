@@ -249,9 +249,13 @@ class GoldAligner(TokenAligner):
 
         if s_buf == t_buf and s_group and t_group:
             flush()
-        # Handle remainders (force flush)
-        if s_group or t_group:
+        elif s_group and t_group:
+            # Remainder groups where s_buf != t_buf — text spans don't match.
+            # Only include if both sides have tokens; the loss on mismatched
+            # spans is approximate but dropping them loses coverage.
             s_groups.append(list(s_group))
             t_groups.append(list(t_group))
+        # If only one side has remainder tokens (the other is exhausted),
+        # skip — there's no counterpart to align against.
 
         return s_groups, t_groups

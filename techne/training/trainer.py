@@ -79,11 +79,11 @@ class TechneTrainer:
                 self.config, self.model, self.tokenizer, dataset, reward_fn_class, **kwargs
             )
 
-        # 2. Offline Distillation
+        # 2. Offline Distillation (synchronous — no await)
         if algo == TrainingAlgorithm.DISTILL_OFFLINE:
             from techne.training.distill import train_distill_offline
 
-            return await train_distill_offline(
+            return train_distill_offline(
                 self.config, self.model, self.tokenizer, data, **kwargs
             )
 

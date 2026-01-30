@@ -51,28 +51,23 @@ class ForwardKLEstimator(DistillationEstimator):
 
     def compute_loss(self, student_logits, teacher_data, **kwargs):
         if isinstance(teacher_data, SparseLogits):
-            # Sparse Forward KL not typically approximated this way for full distribution matching
-            # but we can try estimating it. SLIM usually does this.
-            return self._compute_sparse(student_logits, teacher_data)
+            raise NotImplementedError(
+                "Standard Forward KL with sparse logits not fully defined. Use SlimEstimator."
+            )
 
-        # Dense
-        return self._compute_dense(student_logits, teacher_data)
+        # Dense with proper masking
+        s_logprobs = F.log_softmax(student_logits / self.temperature, dim=-1)
+        t_probs = F.softmax(teacher_data / self.temperature, dim=-1)
 
-    def _compute_dense(self, s_logits, t_logits):
-        s_probs = F.log_softmax(s_logits / self.temperature, dim=-1)
-        t_probs = F.softmax(t_logits / self.temperature, dim=-1)
-        # batchmean: sum over seq, mean over batch. We want mean over tokens usually.
-        # But F.kl_div with 'batchmean' is mathematically correct for KL sum.
-        # To match custom normalization we might want 'reduction=none'
-        loss = F.kl_div(s_probs, t_probs, reduction="batchmean")
-        return loss * (self.temperature**2)
+        # Per-position KL: sum over vocab dimension -> [B, S]
+        kl_per_token = F.kl_div(s_logprobs, t_probs, reduction="none").sum(dim=-1)
 
-    def _compute_sparse(self, s_logits, t_sparse: SparseLogits):
-        # NOT implemented as standard forward KL requires full teacher distribution for proper matching
-        # unless we assume tail is 0.
-        raise NotImplementedError(
-            "Standard Forward KL with sparse logits not fully defined. Use SlimEstimator."
-        )
+        mask = kwargs.get("mask", None)
+        if mask is not None:
+            kl_per_token = kl_per_token * mask
+            return (kl_per_token.sum() / mask.sum().clamp(min=1)) * (self.temperature**2)
+
+        return kl_per_token.mean() * (self.temperature**2)
 
 
 class ReverseKLEstimator(DistillationEstimator):
@@ -224,6 +219,6 @@ class SlimEstimator(DistillationEstimator):
         mask = kwargs.get("mask", None)
         if mask is not None:
             loss = loss * mask
-            return loss.sum() / mask.sum().clamp(min=1)
+            return (loss.sum() / mask.sum().clamp(min=1)) * (self.temperature**2)
 
-        return loss.mean()
+        return loss.mean() * (self.temperature**2)

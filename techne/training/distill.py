@@ -227,10 +227,21 @@ def compute_distillation_reward(
     if not use_kl or student_logits is None or student_tokenizer is None:
         teacher_logprobs = F.log_softmax(teacher_outputs.logits, dim=-1)
         input_ids = teacher_inputs.input_ids[0]
-        # Shift rights
+        # Shift: logits at position t predict token at t+1
         token_logprobs = (
             teacher_logprobs[0, :-1, :].gather(1, input_ids[1:].unsqueeze(-1)).squeeze(-1)
         )
+        # Only average over completion tokens (skip prompt) for a meaningful reward signal.
+        # The prompt log-probs are constant across completions and dilute the signal.
+        prompt_ids = teacher_tokenizer(
+            prompt_text, return_tensors="pt", truncation=True, max_length=max_length
+        ).input_ids[0]
+        prompt_len = len(prompt_ids)
+        # In the shifted space, completion starts at position prompt_len - 1
+        completion_start = max(0, prompt_len - 1)
+        completion_logprobs = token_logprobs[completion_start:]
+        if len(completion_logprobs) > 0:
+            return completion_logprobs.mean().item()
         return token_logprobs.mean().item()
 
     # 3. KL Reward (Aligned)
@@ -278,6 +289,12 @@ class _DistillationTrainer(SFTTrainer):
         self.aligner = None
         if teacher is not None:
             self.aligner = create_aligner(aligner_type, student_tokenizer, teacher_tokenizer)
+            if isinstance(self.aligner, GoldAligner) and distillation_mode != DistillationMode.FORWARD_KL:
+                logger.warning(
+                    "GoldAligner uses its own ULD L1 loss and ignores distillation_mode=%s. "
+                    "The configured estimator will not be used for cross-tokenizer distillation.",
+                    distillation_mode.value,
+                )
 
         # Initialize Estimator based on distillation mode
         if distillation_mode == DistillationMode.SLIM:
@@ -314,33 +331,45 @@ class _DistillationTrainer(SFTTrainer):
         teacher_logprobs: torch.Tensor,
         inputs: dict,
     ) -> torch.Tensor:
-        """Compute KL loss using pre-computed teacher logprobs."""
-        # teacher_logprobs shape: (batch, seq_len) - just the logprob of chosen tokens
-        # We compute KL as: -sum(teacher_logprob) + sum(student_logprob_of_same_token)
-        # This is equivalent to minimizing cross-entropy with teacher's distribution
+        """Compute KL loss using pre-computed teacher logprobs.
 
+        teacher_logprobs[t] = log P_teacher(token_t | token_0..t-1), which
+        corresponds to the teacher's logits at position t-1 (autoregressive shift).
+        We must apply the same shift to the student logits.
+        """
         student_logprobs = F.log_softmax(student_logits, dim=-1)
-        seq_len = min(student_logprobs.shape[1], teacher_logprobs.shape[1])
 
-        # Get student logprobs for the actual tokens
-        input_ids = inputs["input_ids"][:, :seq_len]
-        student_token_logprobs = student_logprobs[:, :seq_len, :].gather(
-            2, input_ids.unsqueeze(-1)
+        # Autoregressive shift: logits at position t predict token at position t+1
+        # student_logprobs[:, t, :] predicts token at t+1
+        # teacher_logprobs[t] is log P(token_t | context) = teacher_logits[t-1]
+        # So we need: student_logprobs[:, t-1, token_t] vs teacher_logprobs[t]
+        shift_student_logprobs = student_logprobs[:, :-1, :]  # [B, S-1, V]
+        shift_input_ids = inputs["input_ids"][:, 1:]  # tokens at positions 1..S-1
+
+        # Align lengths across shifted student and teacher logprobs
+        seq_len = min(shift_student_logprobs.shape[1], teacher_logprobs.shape[1] - 1)
+        shift_student_logprobs = shift_student_logprobs[:, :seq_len, :]
+        shift_input_ids = shift_input_ids[:, :seq_len]
+
+        # Gather student logprobs for the actual next tokens
+        student_token_logprobs = shift_student_logprobs.gather(
+            2, shift_input_ids.clamp(min=0).unsqueeze(-1)
         ).squeeze(-1)
 
+        # Teacher logprobs shifted to match (skip position 0 which has no preceding context)
+        teacher_lp = teacher_logprobs[:, 1 : 1 + seq_len]
+
         # KL divergence: teacher_logprob - student_logprob (we want student to match teacher)
-        # Since we want to minimize, loss = teacher_logprob - student_logprob
-        teacher_lp = teacher_logprobs[:, :seq_len]
         kl_per_token = teacher_lp - student_token_logprobs
 
-        # Build mask
+        # Build mask on the shifted positions
         mask = torch.ones_like(kl_per_token)
         pad_id = self.student_tokenizer.pad_token_id
         if pad_id is not None:
-            mask = mask * (input_ids != pad_id).float()
+            mask = mask * (shift_input_ids != pad_id).float()
         if "labels" in inputs:
-            labels = inputs["labels"][:, :seq_len]
-            mask = mask * (labels != -100).float()
+            shift_labels = inputs["labels"][:, 1 : 1 + seq_len]
+            mask = mask * (shift_labels != -100).float()
 
         # Masked mean
         kl_loss = (kl_per_token * mask).sum() / mask.sum().clamp(min=1)
