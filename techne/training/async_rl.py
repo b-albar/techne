@@ -1077,7 +1077,12 @@ async def train_async_rl(
         )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    use_distributed = num_training_workers > 1 and distributed_backend != DistributedBackend.NONE
+    # Data-parallel distributed training (FSDP/DDP) uses multiple Ray training
+    # workers. TP (tensor parallelism) runs in a single process with device_map.
+    use_distributed = (
+        num_training_workers > 1
+        and distributed_backend in (DistributedBackend.FSDP, DistributedBackend.DDP)
+    )
 
     # For distributed: each GPU gets per_gpu_batch_size, total minibatch = per_gpu * num_workers
     effective_minibatch_size = (

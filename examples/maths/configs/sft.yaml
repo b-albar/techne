@@ -26,7 +26,7 @@ training:
   gradient_accumulation_steps: 32
   max_seq_length: 2048
   num_train_epochs: 6
-  warmup_ratio: 0.1
+  warmup_steps: 50
   weight_decay: 0.01
   max_grad_norm: 1.0
 

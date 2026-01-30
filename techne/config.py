@@ -77,6 +77,7 @@ class DistributedBackend(str, Enum):
     NONE = "none"
     FSDP = "fsdp"
     DDP = "ddp"
+    TP = "tp"  # Tensor parallelism (via PyTorch TP / device_map="auto")
 
 
 class OptimizerType(str, Enum):

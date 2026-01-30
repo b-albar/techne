@@ -7,7 +7,7 @@ import torch
 from datasets import Dataset, Features, Sequence, Value
 from trl import SFTConfig, SFTTrainer
 
-from techne.config import TechneConfig, TrainingAlgorithm
+from techne.config import DistributedBackend, TechneConfig, TrainingAlgorithm
 from techne.data import TrainingSample, Trajectory
 
 logger = logging.getLogger(__name__)
@@ -98,13 +98,16 @@ def get_sft_trainer(
 def get_common_training_args(config: TechneConfig) -> dict:
     """Get common training arguments from config.
 
+    When distributed_backend is FSDP or DDP, passes the appropriate
+    configuration so HF Trainer handles multi-GPU data parallelism.
+
     Args:
         config: Techne configuration
 
     Returns:
         Dictionary of training arguments
     """
-    return {
+    args = {
         "output_dir": config.output_dir,
         "learning_rate": config.training.learning_rate,
         "per_device_train_batch_size": config.training.batch_size,
@@ -123,3 +126,16 @@ def get_common_training_args(config: TechneConfig) -> dict:
         "disable_tqdm": False,
         "log_level": "info",
     }
+
+    backend = config.training.distributed_backend
+    if backend == DistributedBackend.FSDP:
+        args["fsdp"] = "full_shard auto_wrap"
+        args["fsdp_config"] = {
+            "backward_prefetch": "backward_pre",
+            "forward_prefetch": True,
+            "use_orig_params": True,
+        }
+    elif backend == DistributedBackend.DDP:
+        args["ddp_find_unused_parameters"] = False
+
+    return args
