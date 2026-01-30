@@ -90,7 +90,7 @@ def create_scheduler(
     max_steps: int,
 ) -> torch.optim.lr_scheduler.LRScheduler:
     """Create LR scheduler from config."""
-    warmup_steps = int(max_steps * training_config.warmup_ratio)
+    warmup_steps = training_config.warmup_steps
 
     if training_config.scheduler == SchedulerType.COSINE:
 

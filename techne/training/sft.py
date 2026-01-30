@@ -111,7 +111,7 @@ def get_common_training_args(config: TechneConfig) -> dict:
         "gradient_accumulation_steps": config.training.gradient_accumulation_steps,
         "max_steps": config.training.max_steps,
         "num_train_epochs": config.training.num_train_epochs,
-        "warmup_ratio": config.training.warmup_ratio,
+        "warmup_steps": config.training.warmup_steps,
         "weight_decay": config.training.weight_decay,
         "max_grad_norm": config.training.max_grad_norm,
         "bf16": config.model.dtype == torch.bfloat16,

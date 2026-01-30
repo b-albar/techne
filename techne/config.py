@@ -241,7 +241,7 @@ class TrainingConfig(BaseModel):
     learning_rate: float = 1e-6
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
-    warmup_ratio: float = 0.1
+    warmup_steps: int = 0
     optimizer: OptimizerType = OptimizerType.ADAMW
     optimizer_kwargs: dict[str, Any] = Field(default_factory=dict)
     scheduler: SchedulerType = SchedulerType.COSINE
