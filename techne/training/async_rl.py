@@ -1152,7 +1152,7 @@ async def train_async_rl(
             f"Increase ppo_batch_size or decrease batch_size/num_training_workers."
         )
 
-    # Calculate GPU resources
+    # Calculate GPU resources — prefer exclusive GPUs per worker when possible.
     num_gpus = torch.cuda.device_count()
     hybrid_mode = tp_size > 1 and use_distributed
     if num_gpus > 0:
@@ -1164,13 +1164,17 @@ async def train_async_rl(
             gpu_per_inference_worker = remaining_gpus / max(1, num_inference_workers)
             gpu_per_training_worker = tp_size
         else:
-            # Standard: fractional GPU allocation across all workers.
+            # Count all Ray workers that need a GPU.
             total_workers = num_inference_workers + (num_training_workers if use_distributed else 0)
-            gpu_per_worker = 1.0 / (total_workers + 1)  # +1 buffer for main process
-            if gpu_per_worker < 0.1:
-                gpu_per_worker = 0.1
-            gpu_per_inference_worker = gpu_per_worker
-            gpu_per_training_worker = gpu_per_worker
+            if num_gpus >= total_workers:
+                # Enough GPUs: give each worker an exclusive GPU.
+                gpu_per_inference_worker = 1.0
+                gpu_per_training_worker = 1.0
+            else:
+                # Not enough GPUs: share with fractional allocation.
+                gpu_per_worker = num_gpus / max(1, total_workers)
+                gpu_per_inference_worker = gpu_per_worker
+                gpu_per_training_worker = gpu_per_worker
     else:
         gpu_per_inference_worker = 0
         gpu_per_training_worker = 0
