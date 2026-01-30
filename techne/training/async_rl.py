@@ -1118,21 +1118,26 @@ async def train_async_rl(
     ppo_epochs = config.training.ppo_epochs
     sync_weights_interval = config.training.sync_weights_interval
 
+    from techne.training.distributed import detect_device
+
+    num_gpus = torch.cuda.device_count()
+
     if not ray.is_initialized():
-        ray.init(
-            include_dashboard=False,
-            _metrics_export_port=None,
-            configure_logging=False,
-            log_to_driver=False,
-            _system_config={
+        ray_init_kwargs: dict[str, Any] = {
+            "include_dashboard": False,
+            "_metrics_export_port": None,
+            "configure_logging": False,
+            "log_to_driver": False,
+            "_system_config": {
                 "metrics_report_interval_ms": 0,
                 "enable_metrics_collection": False,
             },
-        )
-
-    from techne.training.distributed import detect_device
-
-    device = detect_device(model)
+        }
+        # Reserve GPU 0 for the main-process training model by limiting
+        # the number of GPUs visible to Ray workers.
+        if num_gpus >= 2 and num_training_workers <= 1:
+            ray_init_kwargs["num_gpus"] = num_gpus - 1
+        ray.init(**ray_init_kwargs)
 
     # Data-parallel distributed training (FSDP) uses multiple Ray training
     # workers. TP (tensor parallelism) runs in a single process with device_map.
@@ -1140,6 +1145,14 @@ async def train_async_rl(
         num_training_workers > 1
         and distributed_backend == DistributedBackend.FSDP
     )
+
+    # Pin training model to cuda:0 when multiple GPUs are available,
+    # so Ray inference workers use the remaining GPUs (1, 2, ...).
+    if num_gpus >= 2 and not use_distributed:
+        device = "cuda:0"
+        model.to(device)
+    else:
+        device = detect_device(model)
 
     # For distributed: each GPU gets per_gpu_batch_size, total minibatch = per_gpu * num_workers
     effective_minibatch_size = (
@@ -1156,7 +1169,9 @@ async def train_async_rl(
             f"Increase ppo_batch_size or decrease batch_size/num_training_workers."
         )
 
-    # Calculate GPU resources — prefer exclusive GPUs per worker when possible.
+    # Calculate GPU resources.
+    # Strategy: GPU 0 is reserved for the main-process training model (non-distributed)
+    # or for distributed training workers. Inference workers use the remaining GPUs.
     num_gpus = torch.cuda.device_count()
     hybrid_mode = tp_size > 1 and use_distributed
     if num_gpus > 0:
@@ -1167,18 +1182,25 @@ async def train_async_rl(
             remaining_gpus = max(1, num_gpus - total_training_gpus)
             gpu_per_inference_worker = remaining_gpus / max(1, num_inference_workers)
             gpu_per_training_worker = tp_size
-        else:
-            # Count all Ray workers that need a GPU.
-            total_workers = num_inference_workers + (num_training_workers if use_distributed else 0)
+        elif use_distributed:
+            # Distributed FSDP: training workers are Ray actors too.
+            total_workers = num_inference_workers + num_training_workers
             if num_gpus >= total_workers:
-                # Enough GPUs: give each worker an exclusive GPU.
                 gpu_per_inference_worker = 1.0
                 gpu_per_training_worker = 1.0
             else:
-                # Not enough GPUs: share with fractional allocation.
                 gpu_per_worker = num_gpus / max(1, total_workers)
                 gpu_per_inference_worker = gpu_per_worker
                 gpu_per_training_worker = gpu_per_worker
+        else:
+            # Non-distributed: GPU 0 is used by the main process for training.
+            # Inference workers get the remaining GPUs (1, 2, ...).
+            inference_gpus = max(1, num_gpus - 1)  # at least 1 even on single-GPU
+            if inference_gpus >= num_inference_workers:
+                gpu_per_inference_worker = 1.0
+            else:
+                gpu_per_inference_worker = inference_gpus / max(1, num_inference_workers)
+            gpu_per_training_worker = 0  # training runs in main process, not a Ray actor
     else:
         gpu_per_inference_worker = 0
         gpu_per_training_worker = 0
