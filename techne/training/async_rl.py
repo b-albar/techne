@@ -2,10 +2,10 @@
 
 Architecture:
 - InferenceWorker: Generates completions + computes ref logprobs (HuggingFace)
-- ExperienceBatcher: Collects samples from workers, dispatches to trainer
-- Trainer: Pulls minibatches, computes loss, updates model
+- DynamicBatcher: Continuously dispatches to workers, collects results dynamically
+- TrainingWorker: Distributed training with FSDP/hybrid TP+DP support
 
-Supports: GRPO, PPO, GSPO
+Supports: GRPO, PPO, GSPO, DISTILL
 """
 
 from __future__ import annotations
@@ -422,7 +422,7 @@ class InferenceWorker:
 
 @ray.remote
 class TrainingWorker:
-    """Distributed training worker with FSDP/DDP support."""
+    """Distributed training worker with FSDP/hybrid TP+DP support."""
 
     def __init__(
         self,
@@ -431,39 +431,46 @@ class TrainingWorker:
         world_size: int,
         distributed_backend: DistributedBackend = DistributedBackend.NONE,
         training_config: TrainingConfig | None = None,
+        tensor_parallel_size: int = 1,
     ):
-        import os
+        from techne.training.distributed import init_process_group
 
         self.rank = rank
         self.world_size = world_size
         self.distributed_backend = distributed_backend
         self.training_config = training_config
+        self._hybrid_mode = False
 
-        if distributed_backend == DistributedBackend.FSDP:
-            os.environ["RANK"] = str(rank)
-            os.environ["WORLD_SIZE"] = str(world_size)
-            os.environ["MASTER_ADDR"] = "localhost"
-            os.environ["MASTER_PORT"] = "29500"
-            torch.distributed.init_process_group("nccl", rank=rank, world_size=world_size)
+        uses_device_map = (
+            distributed_backend == DistributedBackend.TP
+            or (tensor_parallel_size > 1 and distributed_backend == DistributedBackend.FSDP)
+        )
+
+        if uses_device_map:
+            # TP or Hybrid TP+DP: load with device_map="auto".
+            # For hybrid, DP gradient sync is manual (allreduce via Ray).
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+
+            self.model = AutoModelForCausalLM.from_pretrained(
+                inference_config.name_or_path,
+                trust_remote_code=getattr(inference_config, "trust_remote_code", False),
+                torch_dtype=inference_config.dtype,
+                attn_implementation=getattr(inference_config, "attn_implementation", None),
+                device_map="auto",
+            )
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                inference_config.name_or_path,
+                trust_remote_code=getattr(inference_config, "trust_remote_code", False),
+            )
+            self._hybrid_mode = tensor_parallel_size > 1
+        elif distributed_backend == DistributedBackend.FSDP:
+            init_process_group(rank, world_size)
 
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP  # noqa: N817
 
             # Create base model via config, then wrap with FSDP
             base_model = inference_config.create_training_model()
             self.model = FSDP(base_model._model.cuda())
-            self.tokenizer = base_model.get_tokenizer()
-        elif distributed_backend == DistributedBackend.DDP:
-            os.environ["RANK"] = str(rank)
-            os.environ["WORLD_SIZE"] = str(world_size)
-            os.environ["MASTER_ADDR"] = "localhost"
-            os.environ["MASTER_PORT"] = "29500"
-            torch.distributed.init_process_group("nccl", rank=rank, world_size=world_size)
-
-            # Create base model via config, then wrap with DDP
-            base_model = inference_config.create_training_model()
-            self.model = torch.nn.parallel.DistributedDataParallel(
-                base_model._model.cuda(rank), device_ids=[rank]
-            )
             self.tokenizer = base_model.get_tokenizer()
         else:
             training_model = inference_config.create_training_model()
@@ -473,7 +480,13 @@ class TrainingWorker:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        self.device = f"cuda:{rank}" if distributed_backend != DistributedBackend.NONE else "cuda"
+        # Device placement: device_map models expose .device, FSDP pins to rank.
+        if uses_device_map:
+            self.device = str(self.model.device)
+        elif distributed_backend == DistributedBackend.FSDP:
+            self.device = f"cuda:{rank}"
+        else:
+            self.device = "cuda"
 
     def train_step(
         self,
@@ -524,15 +537,31 @@ class TrainingWorker:
         """Get model state dict for syncing to inference workers."""
         return {k: v.cpu() for k, v in self.model.state_dict().items()}
 
+    def get_gradients(self) -> dict[str, torch.Tensor]:
+        """Collect gradients from all parameters (for manual allreduce in hybrid mode)."""
+        grads = {}
+        for name, param in self.model.named_parameters():
+            if param.grad is not None:
+                grads[name] = param.grad.cpu()
+        return grads
+
+    def set_averaged_gradients(self, avg_grads: dict[str, torch.Tensor]):
+        """Set averaged gradients back to model parameters (for hybrid mode)."""
+        for name, param in self.model.named_parameters():
+            if name in avg_grads:
+                param.grad = avg_grads[name].to(param.device)
+
     def cleanup(self):
         """Cleanup distributed process group."""
-        if self.distributed_backend != DistributedBackend.NONE:
-            torch.distributed.destroy_process_group()
+        if self.distributed_backend == DistributedBackend.FSDP and not self._hybrid_mode:
+            from techne.training.distributed import destroy_process_group
+
+            destroy_process_group()
 
 
 def compute_advantages(samples: list[Sample]) -> list[Sample]:
     """Compute advantages for samples grouped by prompt (GRPO style)."""
-    prompt_groups: dict[any, list[Sample]] = {}
+    prompt_groups: dict[Any, list[Sample]] = {}
     for s in samples:
         # Handle unhashable prompts (e.g. list of messages)
         if isinstance(s.prompt, list):
@@ -1058,6 +1087,7 @@ async def train_async_rl(
     num_inference_workers = config.training.num_inference_workers
     num_training_workers = config.training.num_training_workers
     distributed_backend = config.training.distributed_backend
+    tp_size = config.training.tensor_parallel_size
     num_generations = config.training.num_generations
     per_gpu_batch_size = config.training.batch_size
     gradient_accumulation_steps = config.training.gradient_accumulation_steps
@@ -1076,12 +1106,15 @@ async def train_async_rl(
             _system_config={"metrics_report_interval_ms": 0},
         )
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    # Data-parallel distributed training (FSDP/DDP) uses multiple Ray training
+    from techne.training.distributed import detect_device
+
+    device = detect_device(model)
+
+    # Data-parallel distributed training (FSDP) uses multiple Ray training
     # workers. TP (tensor parallelism) runs in a single process with device_map.
     use_distributed = (
         num_training_workers > 1
-        and distributed_backend in (DistributedBackend.FSDP, DistributedBackend.DDP)
+        and distributed_backend == DistributedBackend.FSDP
     )
 
     # For distributed: each GPU gets per_gpu_batch_size, total minibatch = per_gpu * num_workers
@@ -1101,27 +1134,31 @@ async def train_async_rl(
 
     # Calculate GPU resources
     num_gpus = torch.cuda.device_count()
+    hybrid_mode = tp_size > 1 and use_distributed
     if num_gpus > 0:
-        # Simple heuristic: Split GPUs between inference and training
-        # If not distributed, training happens in main process (needs GPU), so reserved some implicitly?
-        # Actually, Ray doesn't track main process usage.
-        # We just need to fit workers.
-        # Example: 1 GPU. 1 Inf Worker. Main process training.
-        # Main process takes e.g. 50% memory. Inf worker takes rest.
-        # We tell Ray to give Inf worker 0.5 GPU.
-
-        total_workers = num_inference_workers + (num_training_workers if use_distributed else 0)
-        gpu_per_worker = 1.0 / (total_workers + 1)  # +1 buffer for main process or safety
-        # Ensure at least some fractional amount
-        if gpu_per_worker < 0.1:
-            gpu_per_worker = 0.1
+        if hybrid_mode:
+            # Hybrid TP+DP: each training worker gets tp_size full GPUs,
+            # inference workers share the remaining GPUs.
+            total_training_gpus = num_training_workers * tp_size
+            remaining_gpus = max(1, num_gpus - total_training_gpus)
+            gpu_per_inference_worker = remaining_gpus / max(1, num_inference_workers)
+            gpu_per_training_worker = tp_size
+        else:
+            # Standard: fractional GPU allocation across all workers.
+            total_workers = num_inference_workers + (num_training_workers if use_distributed else 0)
+            gpu_per_worker = 1.0 / (total_workers + 1)  # +1 buffer for main process
+            if gpu_per_worker < 0.1:
+                gpu_per_worker = 0.1
+            gpu_per_inference_worker = gpu_per_worker
+            gpu_per_training_worker = gpu_per_worker
     else:
-        gpu_per_worker = 0
+        gpu_per_inference_worker = 0
+        gpu_per_training_worker = 0
 
     # Create inference workers
     inference_config = config.get_inference_config(device=device)
     inference_workers = [
-        InferenceWorker.options(num_gpus=gpu_per_worker).remote(
+        InferenceWorker.options(num_gpus=gpu_per_inference_worker).remote(
             model_factory=inference_config.create_model_factory(for_training=False),
             num_generations=num_generations,
             max_new_tokens=inference_config.max_new_tokens,
@@ -1137,18 +1174,25 @@ async def train_async_rl(
     training_workers = None
     if use_distributed:
         training_workers = [
-            TrainingWorker.options(num_gpus=gpu_per_worker).remote(
+            TrainingWorker.options(num_gpus=gpu_per_training_worker).remote(
                 inference_config=inference_config,
                 rank=i,
                 world_size=num_training_workers,
                 distributed_backend=distributed_backend,
                 training_config=config.training,
+                tensor_parallel_size=tp_size,
             )
             for i in range(num_training_workers)
         ]
-        logger.info(
-            f"Distributed training: {num_training_workers} workers with {distributed_backend.value.upper()}"
-        )
+        if hybrid_mode:
+            logger.info(
+                f"Hybrid TP+DP training: {num_training_workers} workers x {tp_size} GPUs/worker "
+                f"with {distributed_backend.value.upper()}"
+            )
+        else:
+            logger.info(
+                f"Distributed training: {num_training_workers} workers with {distributed_backend.value.upper()}"
+            )
     else:
         optimizer = create_optimizer(model.parameters(), config.training)
 
@@ -1264,6 +1308,24 @@ async def train_async_rl(
                         for worker_metrics, _ in results:
                             for k, v in worker_metrics.items():
                                 metrics[k] = metrics.get(k, 0) + v / len(results)
+
+                        if hybrid_mode:
+                            # Hybrid TP+DP: manual gradient allreduce across workers
+                            # (FSDP wrapping is incompatible with device_map="auto" TP models)
+                            grad_futures = [w.get_gradients.remote() for w in training_workers]
+                            all_grads = await asyncio.gather(
+                                *[asyncio.wrap_future(f.future()) for f in grad_futures]
+                            )
+                            avg_grads = {}
+                            for name in all_grads[0]:
+                                avg_grads[name] = sum(g[name] for g in all_grads) / len(all_grads)
+                            set_futures = [
+                                w.set_averaged_gradients.remote(avg_grads)
+                                for w in training_workers
+                            ]
+                            await asyncio.gather(
+                                *[asyncio.wrap_future(f.future()) for f in set_futures]
+                            )
                     else:
                         batch = Minibatch(samples=mb_samples)
                         loss, metrics = compute_rl_loss(

@@ -7,21 +7,20 @@ Training types:
 """
 
 import logging
-import os
 from typing import Any
 
 from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from techne.config import DistributedBackend, TechneConfig, TrainingAlgorithm
+from techne.config import TechneConfig, TrainingAlgorithm
 from techne.data import TrainingSample, Trajectory
+from techne.training.distributed import (
+    check_distributed_launcher,
+    get_device_map,
+    is_main_process,
+)
 
 logger = logging.getLogger(__name__)
-
-
-def _is_distributed_env() -> bool:
-    """Check if we're already running inside a distributed launcher (torchrun/accelerate)."""
-    return "RANK" in os.environ and "WORLD_SIZE" in os.environ
 
 
 class TechneTrainer:
@@ -30,18 +29,10 @@ class TechneTrainer:
     def __init__(self, config: TechneConfig):
         self.config = config
 
-        # device_map="auto" enables model/tensor parallelism (sharding layers
-        # across GPUs in a single process). This is the right choice for:
-        #   - Single-process training (NONE backend)
-        #   - Tensor parallelism (TP backend)
-        # FSDP and DDP do their own sharding/replication and require
-        # device_map=None so HF Trainer can manage device placement.
-        backend = config.training.distributed_backend
-        self._wants_data_parallel = (
-            backend in (DistributedBackend.FSDP, DistributedBackend.DDP)
-            and config.training.num_training_workers > 1
+        device_map = get_device_map(
+            config.training.distributed_backend,
+            config.training.num_training_workers,
         )
-        device_map = None if self._wants_data_parallel else "auto"
 
         # Load model
         self.model = AutoModelForCausalLM.from_pretrained(
@@ -86,6 +77,7 @@ class TechneTrainer:
         algo = self.config.training.algorithm
 
         # 1. On-Policy RL Training (GRPO/PPO/GSPO/DISTILL) - async with Ray
+        #    Ray manages its own distributed workers; no launcher check needed.
         if dataset is not None and algo in [
             TrainingAlgorithm.GRPO,
             TrainingAlgorithm.PPO,
@@ -98,6 +90,15 @@ class TechneTrainer:
                 self.config, self.model, self.tokenizer, dataset, reward_fn_class, **kwargs
             )
 
+        # 2 & 3: Offline paths (distillation, SFT/DFT) use HF Trainer.
+        # FSDP requires a multi-process launcher (torchrun/accelerate).
+        # TP runs single-process with device_map="auto" — no launcher needed.
+        check_distributed_launcher(
+            self.config.training.distributed_backend,
+            self.config.training.num_training_workers,
+            self.config.training.tensor_parallel_size,
+        )
+
         # 2. Offline Distillation (synchronous — no await)
         if algo == TrainingAlgorithm.DISTILL_OFFLINE:
             from techne.training.distill import train_distill_offline
@@ -108,28 +109,13 @@ class TechneTrainer:
 
         # 3. Offline Training (SFT/DFT)
         if not data:
-            logger.warning("No data provided for training.")
+            if is_main_process():
+                logger.warning("No data provided for training.")
             return
 
         samples = data
 
         from techne.training.sft import get_sft_trainer
-
-        # FSDP/DDP require a multi-process launcher. TP does not (it runs
-        # in a single process with device_map="auto").
-        if self._wants_data_parallel and not _is_distributed_env():
-            n = self.config.training.num_training_workers
-            backend = self.config.training.distributed_backend
-            if backend == DistributedBackend.FSDP:
-                hint = f"accelerate launch --use_fsdp --num_processes {n} your_script.py"
-            else:
-                hint = f"torchrun --nproc_per_node={n} your_script.py"
-            raise RuntimeError(
-                f"Distributed SFT training requires a multi-process launcher. "
-                f"Config requests {backend.value.upper()} with {n} workers, but the "
-                f"current process was not launched in a distributed context "
-                f"(RANK/WORLD_SIZE not set). Launch with:\n  {hint}"
-            )
 
         trainer = get_sft_trainer(self.config, self.model, self.tokenizer, samples, **kwargs)
         return trainer.train()

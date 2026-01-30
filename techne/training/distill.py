@@ -17,6 +17,7 @@ from trl import SFTConfig, SFTTrainer
 from techne.config import AlignerType, DistillationMode, TechneConfig
 from techne.data import Trajectory
 from techne.training.alignment import DirectAligner, GoldAligner
+from techne.training.distributed import is_main_process
 from techne.training.estimators import (
     AKDEstimator,
     ForwardKLEstimator,
@@ -101,7 +102,8 @@ def train_distill_offline(
     # 1. Normalize to List[Trajectory]
     # We strictly expect serialized trajectories (dicts, json strings) or Trajectory objects
     trajectories = []
-    logger.info("Normalizing dataset to Trajectories...")
+    if is_main_process():
+        logger.info("Normalizing dataset to Trajectories...")
     for item in dataset:
         if isinstance(item, Trajectory):
             trajectories.append(item)
@@ -110,21 +112,25 @@ def train_distill_offline(
             try:
                 trajectories.append(Trajectory.model_validate(item))
             except Exception as e:
-                logger.warning("Failed to validate dict as Trajectory: %s", e)
+                if is_main_process():
+                    logger.warning("Failed to validate dict as Trajectory: %s", e)
         elif isinstance(item, str):
             # Expect JSON string
             try:
                 trajectories.append(Trajectory.model_validate_json(item))
             except Exception as e:
-                logger.warning("Failed to parse JSON string as Trajectory: %s", e)
+                if is_main_process():
+                    logger.warning("Failed to parse JSON string as Trajectory: %s", e)
         else:
-            logger.warning("Skipping unsupported item type: %s", type(item))
+            if is_main_process():
+                logger.warning("Skipping unsupported item type: %s", type(item))
 
     if len(trajectories) == 0:
         raise ValueError("No valid Trajectories found in dataset!")
 
     # 2. Prepare for Distillation (KL Loss)
-    logger.info("Preparing distillation dataset from Trajectories...")
+    if is_main_process():
+        logger.info("Preparing distillation dataset from Trajectories...")
     processed_samples = []
     samples_with_logprobs = 0
 
@@ -146,26 +152,29 @@ def train_distill_offline(
     teacher_tokenizer = None
 
     if all_have_logprobs:
-        logger.info("All %d samples have cached teacher logprobs - skipping teacher model load", len(dataset))
+        if is_main_process():
+            logger.info("All %d samples have cached teacher logprobs - skipping teacher model load", len(dataset))
     else:
         if teacher_config is None:
             raise ValueError(
                 "Distillation requires either cached logprobs in trajectories "
                 "or a teacher config in training.teacher."
             )
-        logger.info("Loading teacher model for logit distillation: %s", teacher_config.name_or_path)
+        if is_main_process():
+            logger.info("Loading teacher model for logit distillation: %s", teacher_config.name_or_path)
         teacher_model = teacher_config.create_inference_model()
         teacher_model.eval()
         teacher_tokenizer = teacher_model.get_tokenizer()
 
         aligner_type = config.training.aligner_type
-        if aligner_type == AlignerType.AUTO:
-            if are_tokenizers_identical(tokenizer, teacher_tokenizer):
-                logger.info("Tokenizers are identical - using direct alignment")
+        if is_main_process():
+            if aligner_type == AlignerType.AUTO:
+                if are_tokenizers_identical(tokenizer, teacher_tokenizer):
+                    logger.info("Tokenizers are identical - using direct alignment")
+                else:
+                    logger.info("Different tokenizers detected - using GOLD alignment")
             else:
-                logger.info("Different tokenizers detected - using GOLD alignment")
-        else:
-            logger.info("Using %s alignment (from config)", aligner_type.value)
+                logger.info("Using %s alignment (from config)", aligner_type.value)
 
     # Create trainer config
     args_dict = get_common_training_args(config)
@@ -190,7 +199,8 @@ def train_distill_offline(
         processing_class=tokenizer,
     )
 
-    logger.info("Starting offline distillation with KL loss on %d samples", len(dataset))
+    if is_main_process():
+        logger.info("Starting offline distillation with KL loss on %d samples", len(dataset))
     return trainer.train()
 
 
@@ -290,11 +300,12 @@ class _DistillationTrainer(SFTTrainer):
         if teacher is not None:
             self.aligner = create_aligner(aligner_type, student_tokenizer, teacher_tokenizer)
             if isinstance(self.aligner, GoldAligner) and distillation_mode != DistillationMode.FORWARD_KL:
-                logger.warning(
-                    "GoldAligner uses its own ULD L1 loss and ignores distillation_mode=%s. "
-                    "The configured estimator will not be used for cross-tokenizer distillation.",
-                    distillation_mode.value,
-                )
+                if is_main_process():
+                    logger.warning(
+                        "GoldAligner uses its own ULD L1 loss and ignores distillation_mode=%s. "
+                        "The configured estimator will not be used for cross-tokenizer distillation.",
+                        distillation_mode.value,
+                    )
 
         # Initialize Estimator based on distillation mode
         if distillation_mode == DistillationMode.SLIM:

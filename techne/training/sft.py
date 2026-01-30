@@ -9,6 +9,7 @@ from trl import SFTConfig, SFTTrainer
 
 from techne.config import DistributedBackend, TechneConfig, TrainingAlgorithm
 from techne.data import TrainingSample, Trajectory
+from techne.training.distributed import build_fsdp_config, is_main_process
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +67,7 @@ def get_sft_trainer(
                 if len(sample.input_ids) <= max_len:
                     data_list.append({"input_ids": sample.input_ids, "labels": sample.labels})
             filtered = len(samples) - len(data_list)
-            if filtered > 0:
+            if filtered > 0 and is_main_process():
                 logger.info(f"Filtered {filtered}/{len(samples)} samples exceeding max_seq_length={max_len}")
             train_dataset = Dataset.from_list(data_list, features=int_features)
         elif isinstance(first, TrainingSample):
@@ -75,13 +76,13 @@ def get_sft_trainer(
                 for s in samples if len(s.input_ids) <= max_len
             ]
             filtered = len(samples) - len(data_list)
-            if filtered > 0:
+            if filtered > 0 and is_main_process():
                 logger.info(f"Filtered {filtered}/{len(samples)} samples exceeding max_seq_length={max_len}")
             train_dataset = Dataset.from_list(data_list, features=int_features)
         elif isinstance(first, dict):
             data_list = [s for s in samples if len(s.get("input_ids", [])) <= max_len]
             filtered = len(samples) - len(data_list)
-            if filtered > 0:
+            if filtered > 0 and is_main_process():
                 logger.info(f"Filtered {filtered}/{len(samples)} samples exceeding max_seq_length={max_len}")
             train_dataset = Dataset.from_list(data_list, features=int_features)
         else:
@@ -98,7 +99,7 @@ def get_sft_trainer(
 def get_common_training_args(config: TechneConfig) -> dict:
     """Get common training arguments from config.
 
-    When distributed_backend is FSDP or DDP, passes the appropriate
+    When distributed_backend is FSDP, passes the appropriate
     configuration so HF Trainer handles multi-GPU data parallelism.
 
     Args:
@@ -123,19 +124,11 @@ def get_common_training_args(config: TechneConfig) -> dict:
         "save_steps": config.save_steps,
         "save_strategy": "steps",
         "remove_unused_columns": False,
-        "disable_tqdm": False,
-        "log_level": "info",
+        "disable_tqdm": not is_main_process(),
+        "log_level": "info" if is_main_process() else "warning",
     }
 
-    backend = config.training.distributed_backend
-    if backend == DistributedBackend.FSDP:
-        args["fsdp"] = "full_shard auto_wrap"
-        args["fsdp_config"] = {
-            "backward_prefetch": "backward_pre",
-            "forward_prefetch": True,
-            "use_orig_params": True,
-        }
-    elif backend == DistributedBackend.DDP:
-        args["ddp_find_unused_parameters"] = False
+    if config.training.distributed_backend == DistributedBackend.FSDP:
+        args.update(build_fsdp_config(config.training.tensor_parallel_size))
 
     return args

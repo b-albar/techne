@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 if TYPE_CHECKING:
     from techne.training.model import InferenceModel, TrainingModel
@@ -76,7 +76,6 @@ class DistributedBackend(str, Enum):
 
     NONE = "none"
     FSDP = "fsdp"
-    DDP = "ddp"
     TP = "tp"  # Tensor parallelism (via PyTorch TP / device_map="auto")
 
 
@@ -270,6 +269,7 @@ class TrainingConfig(BaseModel):
     # Distributed
     distributed_backend: DistributedBackend = DistributedBackend.NONE
     num_training_workers: int = 1
+    tensor_parallel_size: int = 1  # GPUs per DP worker for TP sharding (hybrid TP+DP)
 
     # RL / On-policy
     inference: InferenceConfig | None = None
@@ -283,6 +283,25 @@ class TrainingConfig(BaseModel):
     ppo_batch_size: int | None = None
     sync_weights: bool = True
     sync_weights_interval: int = 10
+
+    @model_validator(mode="after")
+    def _validate_hybrid_parallelism(self):
+        if self.tensor_parallel_size > 1:
+            if self.distributed_backend == DistributedBackend.TP:
+                raise ValueError(
+                    "tensor_parallel_size > 1 with distributed_backend='tp' is redundant. "
+                    "Use distributed_backend='fsdp' for hybrid TP+DP, "
+                    "or set distributed_backend='tp' with tensor_parallel_size=1."
+                )
+            if (
+                self.distributed_backend == DistributedBackend.NONE
+                and self.num_training_workers > 1
+            ):
+                raise ValueError(
+                    "tensor_parallel_size > 1 with num_training_workers > 1 requires "
+                    "distributed_backend='fsdp'."
+                )
+        return self
 
 
 # =============================================================================
