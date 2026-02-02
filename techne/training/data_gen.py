@@ -98,15 +98,20 @@ class TeacherWorker:
 
     def __init__(self, model_factory: ModelFactory):
         self.model = model_factory()
+        self.model.eval()
         self.tokenizer = self.model.get_tokenizer()
         self.device = self.model.device
 
     def compute_logprobs(self, samples: list[GeneratedSample]) -> list[GeneratedSample]:
-        """Compute teacher logprobs for completions."""
-        for sample in samples:
-            sample.teacher_logprobs = self.model.compute_logprobs(
-                sample.prompt_ids, sample.completion_ids
-            )
+        """Compute teacher logprobs for completions.
+
+        Uses batched forward pass — single padded forward instead of
+        one forward per sample.
+        """
+        batch = [(s.prompt_ids, s.completion_ids) for s in samples]
+        all_logprobs = self.model.compute_logprobs_batch(batch)
+        for sample, logprobs in zip(samples, all_logprobs):
+            sample.teacher_logprobs = logprobs
         return samples
 
 

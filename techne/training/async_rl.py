@@ -256,6 +256,8 @@ class InferenceWorker:
         max_new_tokens: int = 512,
         max_seq_length: int | None = None,
         temperature: float = 0.7,
+        top_p: float = 0.95,
+        top_k: int = 20,
         agent_class: Any | None = None,
         agent_config: TechneConfig | None = None,
         reward_fn_class: type | None = None,
@@ -264,10 +266,13 @@ class InferenceWorker:
         self.max_new_tokens = max_new_tokens
         self.max_seq_length = max_seq_length
         self.temperature = temperature
+        self.top_p = top_p
+        self.top_k = top_k
         self.agent_class = agent_class
         self.agent_config = agent_config
 
         self.model = model_factory()
+        self.model.eval()
         self.tokenizer = self.model.get_tokenizer()
         self.device = self.model.device
 
@@ -328,8 +333,6 @@ class InferenceWorker:
             else:
                 prompt_ids = self.tokenizer(prompt_content).input_ids
 
-            prompt_ids_tensor = torch.tensor([prompt_ids], device=self.device)
-
             if self.agent:
                 # Use Agent rollouts (which can have tool calls, multi-turn, etc.)
                 # Repeat prompt for num_generations
@@ -376,29 +379,30 @@ class InferenceWorker:
                         )
                     )
             else:
-                # Raw model generation
+                # Raw model generation with inline logprob extraction.
+                # Passing return_logprobs=True makes generate() capture the
+                # raw logits internally and return per-token log-probs,
+                # eliminating the N separate compute_logprobs forward passes.
+                prompt_ids_tensor = torch.tensor([prompt_ids], device=self.device)
+
                 with torch.no_grad():
-                    outputs = self.model.generate(
+                    gen_out = self.model.generate(
                         input_ids=prompt_ids_tensor,
                         max_new_tokens=self.max_new_tokens,
                         temperature=self.temperature,
                         do_sample=True,
                         num_return_sequences=self.num_generations,
                         pad_token_id=self.tokenizer.pad_token_id,
-                        return_dict_in_generate=True,
+                        return_logprobs=True,
                     )
 
-                for seq in outputs.sequences:
-                    completion_ids = seq[len(prompt_ids) :].tolist()
-
+                for completion_ids, logprobs in zip(gen_out["sequences"], gen_out["logprobs"]):
                     # Drop sequences exceeding max_seq_length
                     if self.max_seq_length is not None and len(prompt_ids) + len(completion_ids) > self.max_seq_length:
                         self._metrics["filtered_long"] += 1
                         continue
 
                     completion = self.tokenizer.decode(completion_ids, skip_special_tokens=True)
-                    # Compute both reference and current policy logprobs
-                    logprobs = self.model.compute_logprobs(prompt_ids, completion_ids)
                     ref_logprobs = logprobs
                     old_logprobs = logprobs  # Same model at generation time
 
@@ -1214,6 +1218,8 @@ async def train_async_rl(
             max_new_tokens=inference_config.max_new_tokens,
             max_seq_length=config.training.max_seq_length,
             temperature=inference_config.temperature,
+            top_p=inference_config.top_p,
+            top_k=inference_config.top_k,
             agent_class=agent_class,
             agent_config=config,
             reward_fn_class=reward_fn_class,

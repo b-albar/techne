@@ -76,8 +76,51 @@ class HuggingFaceInferenceModel(InferenceModel):
         return self._config
 
     def generate(self, input_ids: torch.Tensor = None, **kwargs) -> Any:
-        """Generate tokens."""
-        return self._model.generate(input_ids=input_ids, **kwargs)
+        """Generate tokens.
+
+        Accepts an extra ``return_logprobs`` keyword (not forwarded to HF):
+        when *True*, ``output_logits`` is enabled internally and per-token
+        log-probabilities are extracted from the raw logits before they are
+        freed.  The return value becomes a dict::
+
+            {"sequences": list[list[int]], "logprobs": list[list[float]]}
+
+        where each inner list corresponds to one generated sequence.
+        """
+        return_logprobs = kwargs.pop("return_logprobs", False)
+
+        if not return_logprobs:
+            return self._model.generate(input_ids=input_ids, **kwargs)
+
+        # Enable logit capture so we can derive logprobs without a second
+        # forward pass.
+        kwargs["return_dict_in_generate"] = True
+        kwargs["output_logits"] = True
+        outputs = self._model.generate(input_ids=input_ids, **kwargs)
+
+        prompt_len = input_ids.shape[1]
+        num_sequences = outputs.sequences.shape[0]
+
+        # outputs.logits is a tuple of (num_generated_steps,) tensors each
+        # shaped [num_sequences, vocab_size].  We extract the scalar log-prob
+        # of the actually-sampled token at every step, then discard the full
+        # logits to free memory.
+        all_sequences: list[list[int]] = []
+        all_logprobs: list[list[float]] = []
+
+        for seq_idx in range(num_sequences):
+            completion_ids = outputs.sequences[seq_idx, prompt_len:].tolist()
+            token_lps: list[float] = []
+            for step_idx, token_id in enumerate(completion_ids):
+                if step_idx < len(outputs.logits):
+                    lp = F.log_softmax(outputs.logits[step_idx][seq_idx], dim=-1)
+                    token_lps.append(lp[token_id].item())
+            all_sequences.append(completion_ids)
+            all_logprobs.append(token_lps)
+
+        del outputs
+
+        return {"sequences": all_sequences, "logprobs": all_logprobs}
 
     def clear_kv_cache(self):
         """Clear the KV cache."""
@@ -247,6 +290,48 @@ class HuggingFaceInferenceModel(InferenceModel):
         token_logprobs = log_probs.gather(1, completion_tensor.unsqueeze(1)).squeeze(1)
 
         return token_logprobs.tolist()
+
+    def compute_logprobs_batch(
+        self,
+        batch: list[tuple[list[int], list[int]]],
+    ) -> list[list[float]]:
+        """Batched logprobs: single padded forward pass instead of N passes."""
+        if not batch:
+            return []
+
+        # Build padded input tensor
+        pad_id = (
+            self._tokenizer.pad_token_id
+            if self._tokenizer and self._tokenizer.pad_token_id is not None
+            else 0
+        )
+        sequences = [p + c for p, c in batch]
+        max_len = max(len(s) for s in sequences)
+
+        padded = torch.full(
+            (len(sequences), max_len), pad_id, dtype=torch.long, device=self._device
+        )
+        attention_mask = torch.zeros_like(padded)
+        for i, seq in enumerate(sequences):
+            padded[i, : len(seq)] = torch.tensor(seq, device=self._device)
+            attention_mask[i, : len(seq)] = 1
+
+        with torch.no_grad():
+            outputs = self._model(padded, attention_mask=attention_mask)
+            logits = outputs.logits
+
+        results: list[list[float]] = []
+        for i, (prompt_ids, completion_ids) in enumerate(batch):
+            if not completion_ids:
+                results.append([])
+                continue
+            start = len(prompt_ids) - 1
+            end = start + len(completion_ids)
+            lp = F.log_softmax(logits[i, start:end], dim=-1)
+            ct = torch.tensor(completion_ids, device=self._device)
+            results.append(lp.gather(1, ct.unsqueeze(1)).squeeze(1).tolist())
+
+        return results
 
     def get_tokenizer(self) -> PreTrainedTokenizer | None:
         return self._tokenizer

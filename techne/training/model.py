@@ -105,6 +105,23 @@ class InferenceModel(ABC):
         """
         ...
 
+    def compute_logprobs_batch(
+        self,
+        batch: list[tuple[list[int], list[int]]],
+    ) -> list[list[float]]:
+        """Compute log probabilities for a batch of (prompt_ids, completion_ids).
+
+        Default implementation calls compute_logprobs per sample.
+        Backends may override with a padded single-forward-pass version.
+
+        Args:
+            batch: List of (prompt_ids, completion_ids) tuples.
+
+        Returns:
+            List of logprob lists, one per sample.
+        """
+        return [self.compute_logprobs(p, c) for p, c in batch]
+
     @abstractmethod
     def get_tokenizer(self) -> Any:
         """Return the tokenizer associated with this model."""
